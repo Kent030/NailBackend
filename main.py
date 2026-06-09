@@ -8,8 +8,13 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 # ==========================================
 # 1. 資料庫設定
 # ==========================================
-SQLALCHEMY_DATABASE_URL = "sqlite:///./bookings.db" 
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+#SQLALCHEMY_DATABASE_URL = "sqlite:///./bookings.db" 
+#engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+# ★ 新的 Supabase 雲端資料庫連線
+SQLALCHEMY_DATABASE_URL = "postgresql://postgres:Lun09260616@@db.sugdvdzopuvoronneugd.supabase.co:5432/postgres"
+# 建立 PostgreSQL 引擎 (不需要 check_same_thread 了)
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
