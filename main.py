@@ -102,6 +102,7 @@ def get_db():
 # 4. API 路由 (Endpoints)
 # ==========================================
 @app.get("/")
+@app.head("/") # ★【新增這行】專門開給 UptimeRobot 機器人敲門用！
 def read_root():
     return {"message": "歡迎！美甲系統已切換為『完全預約制』並啟動 LINE 通知模式！"}
 
