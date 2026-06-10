@@ -12,7 +12,11 @@ from sqlalchemy.orm import sessionmaker, declarative_base, Session
 #engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 # ★ 新的 Supabase 雲端資料庫連線
 # ★ 改用 Supabase 的 IPv4 中繼站連線
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres.sugdvdzopuvoronneugd:Lun09260616!@aws-0-ap-northeast-1.pooler.supabase.com:6543/postgres"
+# Connect to Postgres via the shared transaction-mode pooler (IPv4-only)
+DATABASE_URL="postgresql://postgres.sugdvdzopuvoronneugd:Lun09260616!@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres?pgbouncer=true"
+
+# Connect to Postgres via the shared session-mode pooler (used for migrations)
+DIRECT_URL="postgresql://postgres.sugdvdzopuvoronneugd:Lun09260616!@aws-1-ap-northeast-1.pooler.supabase.com:5432/postgres"
 # 建立 PostgreSQL 引擎 (不需要 check_same_thread 了)
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 
