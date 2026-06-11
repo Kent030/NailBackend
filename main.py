@@ -236,6 +236,41 @@ def update_booking(booking_id: int, booking_update: BookingCreate, db: Session =
         "new_end_time": calculated_end_time.strftime('%Y-%m-%d %H:%M')
     }
 
+# ==========================================
+# 5. 自動化提醒專用路由 (給 GitHub Actions 呼叫的)
+# ==========================================
+@app.get("/send-reminders")
+def send_daily_reminders(db: Session = Depends(get_db)):
+    # 1. 取得「台灣時間」的今天與明天
+    utc_now = datetime.utcnow()
+    tw_now = utc_now + timedelta(hours=8)
+    tw_tomorrow = tw_now + timedelta(days=1)
+    
+    # 2. 設定明天一整天的時間範圍 (00:00:00 到 23:59:59)
+    start_of_tomorrow = tw_tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_of_tomorrow = start_of_tomorrow + timedelta(days=1)
+    
+    # 3. 去資料庫撈出明天要來的客人
+    tomorrow_bookings = db.query(BookingDB).filter(
+        BookingDB.start_time >= start_of_tomorrow,
+        BookingDB.start_time < end_of_tomorrow
+    ).all()
+    
+    reminded_count = 0
+    
+    # 4. 迴圈檢查，有綁定 LINE 的就發送提醒
+    for b in tomorrow_bookings:
+        if b.line_user_id:
+            time_str = b.start_time.strftime('%H:%M')
+            date_str = tw_tomorrow.strftime('%m/%d')
+            
+            msg = f"【明日預約溫馨提醒】🔔\n親愛的 {b.user_name} 您好！\n提醒您明天 ({date_str}) {time_str} 有預約美甲服務：\n💅 項目：{b.service_name}\n\n期待您的光臨！若有任何變動請提早告知老闆喔🥰"
+            
+            send_line_push(b.line_user_id, msg)
+            reminded_count += 1
+            
+    return {"message": f"執行完畢！共找到了 {len(tomorrow_bookings)} 筆明天的預約，並成功發送了 {reminded_count} 則 LINE 提醒。"}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
