@@ -1,0 +1,18 @@
+name: 每日預約提醒鬧鐘
+
+# 設定鬧鐘什麼時候要響
+on:
+  schedule:
+    # 這是 UTC 時間。UTC 12:00 = 台灣時間晚上 20:00 (晚上 8 點)
+    - cron: '0 12 * * *'
+  
+  # 這個超重要！它讓我們可以在 GitHub 上按一顆按鈕「手動」測試鬧鐘
+  workflow_dispatch: 
+
+jobs:
+  wake-up-api:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 戳一下後端大腦發送提醒
+        # 這裡的網址就是你剛剛測試成功的那個端點！
+        run: curl -s https://nail-booking-api-bx93.onrender.com/send-reminders
