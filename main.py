@@ -30,7 +30,6 @@ if google_creds_str:
         print(f"Google Calendar 授權失敗: {e}")
 
 def add_to_google_calendar(guest_name: str, start_time: datetime, end_time: datetime, service_name: str):
-    """把預約寫入 Google 日曆"""
     if not calendar_service or not CALENDAR_ID:
         return None
     try:
@@ -53,11 +52,9 @@ def add_to_google_calendar(guest_name: str, start_time: datetime, end_time: date
         return None
 
 def get_google_calendar_events():
-    """★【新增】讀取 Google 日曆上老闆手動新增的私人行程"""
     if not calendar_service or not CALENDAR_ID:
         return []
     try:
-        # 從現在開始抓取未來的行程
         now = datetime.utcnow().isoformat() + 'Z' 
         events_result = calendar_service.events().list(
             calendarId=CALENDAR_ID, 
@@ -72,15 +69,12 @@ def get_google_calendar_events():
         
         for event in events:
             summary = event.get('summary', '私人行程')
-            
-            # 如果標題是「預約：」開頭，代表是系統自己寫進去的，資料庫裡已經有了，不需要重複抓
             if summary.startswith('預約：'):
                 continue
             
             start_info = event['start']
             end_info = event['end']
             
-            # 處理 Google 回傳的時間格式 (包含全天行程和一般時段行程)
             if 'dateTime' in start_info:
                 start_dt = datetime.strptime(start_info['dateTime'][:19], "%Y-%m-%dT%H:%M:%S")
                 end_dt = datetime.strptime(end_info['dateTime'][:19], "%Y-%m-%dT%H:%M:%S")
@@ -93,7 +87,6 @@ def get_google_calendar_events():
                 "start_time": start_dt,
                 "end_time": end_dt
             })
-            
         return busy_slots
     except Exception as e:
         print(f"讀取 Google 日曆失敗: {e}")
@@ -125,7 +118,6 @@ def send_line_push(line_user_id: str, text_message: str):
 # 1. 資料庫設定
 # ==========================================
 SQLALCHEMY_DATABASE_URL = "postgresql://postgres.sugdvdzopuvoronneugd:Lun09260616!@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres"
-
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -143,7 +135,7 @@ class BookingDB(Base):
 Base.metadata.create_all(bind=engine)
 
 # ==========================================
-# 2. 營業設定
+# 2. 營業設定與固定時段 (★ 重點修改區)
 # ==========================================
 SERVICES_MENU = {
     "單色凝膠": 90,
@@ -158,6 +150,9 @@ LEAVE_TIMES = [
     ("2026-06-20 00:00", "2026-06-21 23:59")   
 ]
 
+# ★【新增】老闆指定的固定預約時段 (可依照你的營業習慣自由增減)
+AVAILABLE_SLOTS = ["10:00", "13:00", "16:00", "19:00"]
+
 class BookingCreate(BaseModel):
     user_name: str
     user_phone: str
@@ -165,7 +160,7 @@ class BookingCreate(BaseModel):
     start_time: datetime
     line_user_id: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 雙向同步版")
+app = FastAPI(title="單人美甲工作室 - 固定時段按鈕版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -188,12 +183,64 @@ def get_db():
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "歡迎！系統已啟動 LINE 與 Google 日曆『雙向』同步模式！"}
+    return {"message": "系統已升級為『固定時段預約模式』！"}
+
+@app.get("/daily-schedule")
+def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
+    """★【新增】給前端查詢某一天所有時段的狀態，用來產出按鈕"""
+    try:
+        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="日期格式錯誤，請使用 YYYY-MM-DD")
+
+    # 撈取資料庫與 Google 日曆
+    db_bookings = db.query(BookingDB).all()
+    google_events = get_google_calendar_events()
+    
+    # 統整當天的所有「佔用時間」
+    busy_blocks = []
+    for b in db_bookings:
+        if b.start_time.date() == target_date:
+            busy_blocks.append((b.start_time, b.end_time, "已預約"))
+            
+    for ge in google_events:
+        if ge['start_time'].date() == target_date:
+            busy_blocks.append((ge['start_time'], ge['end_time'], ge['summary']))
+
+    schedule_result = []
+    
+    # 檢查每個老闆指定的時段
+    for slot_time_str in AVAILABLE_SLOTS:
+        slot_dt = datetime.strptime(f"{date_str} {slot_time_str}", "%Y-%m-%d %H:%M")
+        # 為了檢查衝突，我們假設一個時段預設會佔用 2.5 小時 (可依據你的服務最長時間調整)
+        slot_end_dt = slot_dt + timedelta(hours=2, minutes=30) 
+        
+        status = "可預約"
+        reason = ""
+        
+        # 1. 檢查是否跟既有預約或日曆行程打架
+        for b_start, b_end, b_reason in busy_blocks:
+            if slot_dt < b_end and slot_end_dt > b_start:
+                status = "不可預約"
+                # 如果是 Google 來的標題，前端就可以顯示「休息中」或「老闆私事」
+                reason = "已被預約" if b_reason == "已預約" else "老闆休息中"
+                break
+                
+        # 2. 檢查時間是否已經過去了 (防呆)
+        if slot_dt < datetime.now():
+            status = "不可預約"
+            reason = "時間已過"
+            
+        schedule_result.append({
+            "time": slot_time_str,
+            "status": status,
+            "reason": reason
+        })
+        
+    return {"date": date_str, "slots": schedule_result}
 
 @app.get("/bookings")
 def get_all_bookings(db: Session = Depends(get_db)):
-    """★【修改】合併回傳『資料庫的預約』加上『Google 日曆的私人行程』"""
-    # 1. 抓取資料庫原本的訂單
     db_bookings = db.query(BookingDB).all()
     result = []
     for b in db_bookings:
@@ -206,10 +253,8 @@ def get_all_bookings(db: Session = Depends(get_db)):
             "end_time": b.end_time,
             "line_user_id": b.line_user_id
         })
-        
-    # 2. 抓取 Google 日曆上的老闆私人行程，並偽裝成訂單格式
     google_events = get_google_calendar_events()
-    fake_id = -1 # 給私人行程一個虛擬的負數 ID，避免跟資料庫衝突
+    fake_id = -1 
     for ge in google_events:
         result.append({
             "id": fake_id,
@@ -221,54 +266,41 @@ def get_all_bookings(db: Session = Depends(get_db)):
             "line_user_id": None
         })
         fake_id -= 1
-        
     return result
-
-@app.get("/bookings/search")
-def search_bookings(name: str, phone: str, db: Session = Depends(get_db)):
-    user_bookings = db.query(BookingDB).filter(
-        BookingDB.user_name == name,
-        BookingDB.user_phone == phone
-    ).all()
-    if not user_bookings:
-        raise HTTPException(status_code=404, detail="找不到符合此姓名與電話的預約紀錄喔！")
-    return user_bookings
 
 @app.post("/bookings")
 def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
-    # 確保時間格式沒有時區衝突
     booking_start_time = booking.start_time.replace(tzinfo=None)
     
+    # ★【防呆檢查】確定客人選的時間，真的是老闆指定的時段
+    req_time_str = booking_start_time.strftime('%H:%M')
+    if req_time_str not in AVAILABLE_SLOTS:
+        raise HTTPException(status_code=400, detail=f"只能預約系統指定的時段喔！({', '.join(AVAILABLE_SLOTS)})")
+    
     if booking.service_name not in SERVICES_MENU:
-        raise HTTPException(status_code=400, detail=f"找不到『{booking.service_name}』這項服務喔！")
+        raise HTTPException(status_code=400, detail=f"找不到這項服務喔！")
     if booking_start_time < datetime.now():
-         raise HTTPException(status_code=400, detail="時光機還沒發明喔！請選擇未來的時間進行預約。")
+         raise HTTPException(status_code=400, detail="請選擇未來的時間。")
 
     duration = SERVICES_MENU[booking.service_name]
     calculated_end_time = booking_start_time + timedelta(minutes=(duration + BUFFER_TIME))
 
-    # 檢查手動休假時間
     for start_str, end_str in LEAVE_TIMES:
         leave_start = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
         leave_end = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
         if booking_start_time < leave_end and calculated_end_time > leave_start:
-            raise HTTPException(status_code=400, detail="不好意思！這個時段老闆私事外出/休假中，不開放預約喔。")
+            raise HTTPException(status_code=400, detail="這個時段老闆休假中喔。")
 
-    # 檢查資料庫既有預約
     existing_bookings = db.query(BookingDB).all()
     for eb in existing_bookings:
         if booking_start_time < eb.end_time and calculated_end_time > eb.start_time:
-            exist_start = eb.start_time.strftime('%Y-%m-%d %H:%M')
-            exist_end = eb.end_time.strftime('%H:%M')
-            raise HTTPException(status_code=400, detail=f"預約失敗！時段衝突。（衝突預約：{exist_start} ~ {exist_end}）")
+            raise HTTPException(status_code=400, detail="預約失敗！時段衝突。")
 
-    # ★【新增】檢查 Google 日曆私人行程衝突
     google_events = get_google_calendar_events()
     for ge in google_events:
         if booking_start_time < ge['end_time'] and calculated_end_time > ge['start_time']:
-            raise HTTPException(status_code=400, detail=f"預約失敗！這個時段老闆有其他行程喔。")
+            raise HTTPException(status_code=400, detail="這個時段老闆有其他行程喔。")
 
-    # 寫入資料庫
     new_booking = BookingDB(
         user_name=booking.user_name,
         user_phone=booking.user_phone,
@@ -281,13 +313,11 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_booking)
     
-    # 發送 LINE 通知
     if booking.line_user_id:
         start_time_str = booking_start_time.strftime('%Y-%m-%d %H:%M')
         msg = f"親愛的 {booking.user_name} 您好！✨\n您已成功預約美甲服務：\n💅 項目：{booking.service_name}\n⏰ 時間：{start_time_str}\n\n期待您的光臨！🥰"
         send_line_push(booking.line_user_id, msg)
 
-    # 寫入老闆的 Google 日曆
     add_to_google_calendar(
         guest_name=booking.user_name,
         start_time=booking_start_time,
@@ -297,16 +327,14 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     
     return {
         "message": "預約成功！", 
-        "booking_id": new_booking.id,
-        "auto_end_time": calculated_end_time.strftime('%Y-%m-%d %H:%M')
+        "booking_id": new_booking.id
     }
 
 @app.delete("/bookings/{booking_id}")
 def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     booking_to_delete = db.query(BookingDB).filter(BookingDB.id == booking_id).first()
     if not booking_to_delete:
-        raise HTTPException(status_code=404, detail=f"找不到訂單編號為 {booking_id} 的紀錄！")
-    
+        raise HTTPException(status_code=404, detail="找不到紀錄！")
     target_line_id = booking_to_delete.line_user_id
     target_start_time = booking_to_delete.start_time.strftime('%Y-%m-%d %H:%M')
     
@@ -314,59 +342,10 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     db.commit()
     
     if target_line_id:
-        msg = f"【預約取消通知】\n您原定於 {target_start_time} 的預約已取消成功。如有任何問題，歡迎隨時聯繫老闆！"
+        msg = f"【預約取消通知】\n您原定於 {target_start_time} 的預約已取消成功。"
         send_line_push(target_line_id, msg)
         
-    return {"message": f"成功取消預約！已刪除訂單編號: {booking_id}"}
-
-@app.put("/bookings/{booking_id}")
-def update_booking(booking_id: int, booking_update: BookingCreate, db: Session = Depends(get_db)):
-    booking_start_time = booking_update.start_time.replace(tzinfo=None)
-    booking_to_update = db.query(BookingDB).filter(BookingDB.id == booking_id).first()
-    
-    if not booking_to_update:
-        raise HTTPException(status_code=404, detail=f"找不到紀錄！")
-    if booking_start_time < datetime.now():
-         raise HTTPException(status_code=400, detail="請選擇未來的時間。")
-    if booking_update.service_name not in SERVICES_MENU:
-        raise HTTPException(status_code=400, detail=f"找不到此服務！")
-    
-    duration = SERVICES_MENU[booking_update.service_name]
-    calculated_end_time = booking_start_time + timedelta(minutes=(duration + BUFFER_TIME))
-
-    for start_str, end_str in LEAVE_TIMES:
-        leave_start = datetime.strptime(start_str, "%Y-%m-%d %H:%M")
-        leave_end = datetime.strptime(end_str, "%Y-%m-%d %H:%M")
-        if booking_start_time < leave_end and calculated_end_time > leave_start:
-            raise HTTPException(status_code=400, detail="新時段老闆休假中！")
-
-    existing_bookings = db.query(BookingDB).filter(BookingDB.id != booking_id).all()
-    for eb in existing_bookings:
-        if booking_start_time < eb.end_time and calculated_end_time > eb.start_time:
-            raise HTTPException(status_code=400, detail="新時段跟別人衝突囉！")
-
-    # ★【新增】檢查修改後的時間是否跟 Google 日曆私人行程衝突
-    google_events = get_google_calendar_events()
-    for ge in google_events:
-        if booking_start_time < ge['end_time'] and calculated_end_time > ge['start_time']:
-            raise HTTPException(status_code=400, detail=f"修改失敗！新時段老闆有其他行程喔。")
-
-    booking_to_update.user_name = booking_update.user_name
-    booking_to_update.user_phone = booking_update.user_phone
-    booking_to_update.service_name = booking_update.service_name
-    booking_to_update.start_time = booking_start_time
-    booking_to_update.end_time = calculated_end_time
-    
-    if booking_update.line_user_id:
-        booking_to_update.line_user_id = booking_update.line_user_id
-
-    db.commit()
-    db.refresh(booking_to_update)
-    
-    return {
-        "message": f"成功修改訂單 {booking_id}！", 
-        "new_end_time": calculated_end_time.strftime('%Y-%m-%d %H:%M')
-    }
+    return {"message": "成功取消預約！"}
 
 @app.get("/send-reminders")
 def send_daily_reminders(db: Session = Depends(get_db)):
@@ -391,7 +370,7 @@ def send_daily_reminders(db: Session = Depends(get_db)):
             send_line_push(b.line_user_id, msg)
             reminded_count += 1
             
-    return {"message": f"執行完畢！發送了 {reminded_count} 則 LINE 提醒。"}
+    return {"message": f"發送了 {reminded_count} 則 LINE 提醒。"}
 
 if __name__ == "__main__":
     import uvicorn
