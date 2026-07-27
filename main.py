@@ -1,5 +1,6 @@
 import os 
 import json 
+import re
 from google.oauth2 import service_account 
 from googleapiclient.discovery import build 
 
@@ -165,7 +166,7 @@ class BookingCreate(BaseModel):
     start_time: datetime
     line_user_id: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 顯示開放時段版")
+app = FastAPI(title="單人美甲工作室 - 絕對獨裁版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -182,13 +183,36 @@ def get_db():
     finally:
         db.close()
 
+# ★ 核心判斷邏輯：Google 日曆就是聖旨！
+def get_event_status(summary, start_time):
+    summary = summary.strip()
+    if not summary:
+        return "PRIVATE"
+        
+    # 1. 標題完全只有數字、冒號、點、空白 (例如 "10:00", "14：00") -> 開放預約
+    if re.fullmatch(r'^[0-9:：.\s]+$', summary):
+        return "OPEN"
+        
+    # 2. 開頭有時間字串，但後面有跟著字 (例如 "10:00 王小明", "10v小橘") -> 已被預約
+    t1 = start_time.strftime("%H:%M") # "09:00"
+    t2 = t1.lstrip("0")               # "9:00"
+    t3 = start_time.strftime("%H")    # "09"
+    t4 = t3.lstrip("0")               # "9"
+    
+    if summary.startswith(t1) or summary.startswith(t2) or summary.startswith(t3) or summary.startswith(t4):
+        return "BOOKED"
+        
+    # 3. 其他全中文 -> 私人休息
+    return "PRIVATE"
+
+
 # ==========================================
 # 4. API 路由 (Endpoints)
 # ==========================================
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統已更新！行事曆現在會顯示可預約時段囉！"}
+    return {"message": "系統已更新！採用 Google 日曆絕對獨裁防呆機制。"}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -197,7 +221,6 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
     except ValueError:
         raise HTTPException(status_code=400, detail="日期格式錯誤")
 
-    db_bookings = db.query(BookingDB).all()
     google_events = get_google_calendar_events()
     
     is_day_off = any(ge for ge in google_events if ge['start_time'].date() == target_date and ge['is_full_day'])
@@ -208,19 +231,16 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
     for ge in google_events:
         if ge['start_time'].date() == target_date and not ge['is_full_day']:
             time_str = ge['start_time'].strftime("%H:%M") 
-            summary = ge['summary']
+            status = get_event_status(ge['summary'], ge['start_time'])
             
-            if summary == time_str:
+            if status == "OPEN":
                 if ge['start_time'] < datetime.now():
-                    pass 
+                    pass # 時間過了就不給約
                 else:
-                    is_booked = any(b for b in db_bookings if b.start_time == ge['start_time'])
-                    if is_booked:
-                        schedule_result.append({"time": time_str, "status": "不可預約", "reason": "已被預約"})
-                    else:
-                        schedule_result.append({"time": time_str, "status": "可預約", "reason": ""})
+                    # 無視資料庫舊資料，老闆說開放就是開放！
+                    schedule_result.append({"time": time_str, "status": "可預約", "reason": ""})
             
-            elif summary.startswith(time_str) and len(summary) > len(time_str):
+            elif status == "BOOKED":
                 schedule_result.append({"time": time_str, "status": "不可預約", "reason": "已被預約"})
                 
     schedule_result.sort(key=lambda x: x["time"])
@@ -229,37 +249,47 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
 @app.get("/bookings")
 def get_all_bookings(db: Session = Depends(get_db)):
     db_bookings = db.query(BookingDB).all()
-    result = []
-    db_start_times = []
-    
-    for b in db_bookings:
-        db_start_times.append(b.start_time)
-        result.append({
-            "id": b.id,
-            "user_name": b.user_name,
-            "user_phone": b.user_phone,
-            "service_name": b.service_name,
-            "start_time": b.start_time,
-            "end_time": b.end_time,
-            "line_user_id": b.line_user_id
-        })
-        
     google_events = get_google_calendar_events()
+    result = []
+    
+    # 建立行事曆當前狀態地圖
+    gcal_status_map = {}
+    for ge in google_events:
+        gcal_status_map[ge['start_time']] = {
+            "status": "FULL_DAY" if ge['is_full_day'] else get_event_status(ge['summary'], ge['start_time']),
+            "summary": ge['summary'],
+            "end_time": ge['end_time']
+        }
+    
+    # 【資料庫的訂單】：只有當 Google 日曆確實是「已被預約」狀態時，才輸出資料庫裡的客人資料 (供查詢功能使用)
+    db_start_times = []
+    for b in db_bookings:
+        gcal_info = gcal_status_map.get(b.start_time)
+        if gcal_info and gcal_info["status"] == "BOOKED":
+            db_start_times.append(b.start_time)
+            result.append({
+                "id": b.id,
+                "user_name": b.user_name,
+                "user_phone": b.user_phone,
+                "service_name": b.service_name,
+                "start_time": b.start_time,
+                "end_time": b.end_time,
+                "line_user_id": b.line_user_id
+            })
+            
+    # 【Google 行事曆行程】：補上那些沒有在資料庫裡的空檔、私人休息或手動填寫的預約
     fake_id = -1 
     for ge in google_events:
-        summary = ge['summary']
-        time_str = ge['start_time'].strftime("%H:%M")
-        
-        # 已經存在資料庫的重複訂單跳過
-        if not ge['is_full_day'] and ge['start_time'] in db_start_times:
+        if ge['start_time'] in db_start_times:
             continue
             
-        # ★【核心修改】將「標題 = 時間 (例如 10:00)」的狀態標記為「可預約」，不再隱藏！
-        if ge['is_full_day']:
+        status = gcal_status_map[ge['start_time']]["status"]
+        
+        if status == "FULL_DAY":
             user_name_display = "🏖️ 店休日"
-        elif summary == time_str:
+        elif status == "OPEN":
             user_name_display = "✨ 可預約"
-        elif summary.startswith(time_str) and len(summary) > len(time_str):
+        elif status == "BOOKED":
             user_name_display = "已被預約"
         else:
             user_name_display = "🔒 休息"
@@ -268,12 +298,13 @@ def get_all_bookings(db: Session = Depends(get_db)):
             "id": fake_id,
             "user_name": user_name_display,
             "user_phone": "0000000000",
-            "service_name": summary,
-            "start_time": ge["start_time"],
-            "end_time": ge["end_time"],
+            "service_name": ge['summary'],
+            "start_time": ge['start_time'],
+            "end_time": ge['end_time'],
             "line_user_id": None
         })
         fake_id -= 1
+        
     return result
 
 @app.post("/bookings")
@@ -285,8 +316,7 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     target_event_id = None
     for ge in google_events:
         if ge['start_time'] == booking_start_time and not ge['is_full_day']:
-            summary = ge['summary']
-            if summary == time_str:
+            if get_event_status(ge['summary'], ge['start_time']) == "OPEN":
                 target_event_id = ge['id']
                 break
                 
