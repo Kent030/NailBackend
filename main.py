@@ -4,7 +4,6 @@ import re
 from google.oauth2 import service_account 
 from googleapiclient.discovery import build 
 
-import requests 
 from typing import Optional 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends
@@ -110,28 +109,6 @@ def revert_google_calendar_event(start_time: datetime):
         print(f"恢復 Google 日曆失敗: {e}")
 
 # ==========================================
-# ★ LINE Messaging API 設定 
-# ==========================================
-LINE_ACCESS_TOKEN = "VjmXl7a6yv5rnm4IWsDYW40iGTn5rlIYoTy+nMc5AYqXx4sOapBr9Uf2uID9LVV3xIa9RhDA4PqtZdW3AGQznl3DmFM3BjZvkhokgPWXMvt++bQrmNeOJ7xc6S56xhtsB6+1tU3MJn/e7R2+ILT2iQdB04t89/1O/w1cDnyilFU="
-
-def send_line_push(line_user_id: str, text_message: str):
-    if not line_user_id or line_user_id == "undefined":
-        return 
-    url = "https://api.line.me/v2/bot/message/push"
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {LINE_ACCESS_TOKEN}"
-    }
-    payload = {
-        "to": line_user_id,
-        "messages": [{"type": "text", "text": text_message}]
-    }
-    try:
-        requests.post(url, json=payload, headers=headers)
-    except Exception:
-        pass
-
-# ==========================================
 # 1. 資料庫設定
 # ==========================================
 SQLALCHEMY_DATABASE_URL = "postgresql://postgres.sugdvdzopuvoronneugd:Lun09260616!@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres"
@@ -147,7 +124,6 @@ class BookingDB(Base):
     service_name = Column(String, default="美甲預約") 
     start_time = Column(DateTime)
     end_time = Column(DateTime)
-    line_user_id = Column(String, nullable=True) 
 
 Base.metadata.create_all(bind=engine)
 
@@ -158,9 +134,8 @@ class BookingCreate(BaseModel):
     user_name: str
     user_phone: str
     start_time: datetime
-    line_user_id: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 純圖示與文字區分版")
+app = FastAPI(title="單人美甲工作室 - 純網頁極簡版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -177,31 +152,23 @@ def get_db():
     finally:
         db.close()
 
-# ★ 修正核心判斷邏輯：精準區分「純圖示」與「客人名字夾帶圖示」
 def get_event_status(summary, start_time):
     summary = summary.strip()
     if not summary:
         return "PRIVATE"
         
-    # 1. 檢查是否包含休息關鍵字
     has_keyword = any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留"])
     if has_keyword:
         return "PRIVATE"
         
-    # 2. 標題完全只有數字、冒號、點、空白 (例如 "10:00", "14：00") -> 開放預約
     if re.fullmatch(r'^[0-9:：.\s]+$', summary):
         return "OPEN"
         
-    # 3. 檢查是否有「一般文字」 (包含中文、英文字母、數字)
     has_text = bool(re.search(r'[a-zA-Z0-9\u4e00-\u9fa5]', summary))
-    
-    # 如果「完全沒有一般文字」，代表老闆只打了純圖示 (例如 "❌", "🏖️") -> 老闆休息
     if not has_text:
         return "PRIVATE"
         
-    # 4. 只要有打出任何中英數文字 (例如 "V伍O萱 🖐️ 🦶", "10:00 王小明") -> 一律視為「已被預約」
     return "BOOKED"
-
 
 # ==========================================
 # 4. API 路由 (Endpoints)
@@ -209,7 +176,7 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統已更新！完美支援客人姓名夾帶表情符號的預約判定。"}
+    return {"message": "系統運行中：無 LINE 純網頁預約版本。"}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -267,8 +234,7 @@ def get_all_bookings(db: Session = Depends(get_db)):
                 "user_phone": b.user_phone,
                 "service_name": "美甲預約",
                 "start_time": b.start_time,
-                "end_time": b.end_time,
-                "line_user_id": b.line_user_id
+                "end_time": b.end_time
             })
             
     fake_id = -1 
@@ -293,8 +259,7 @@ def get_all_bookings(db: Session = Depends(get_db)):
             "user_phone": "0000000000",
             "service_name": "美甲預約" if status == "BOOKED" else ge['summary'],
             "start_time": ge['start_time'],
-            "end_time": ge['end_time'],
-            "line_user_id": None
+            "end_time": ge['end_time']
         })
         fake_id -= 1
         
@@ -323,17 +288,11 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
         user_phone=booking.user_phone,
         service_name="美甲預約",
         start_time=booking_start_time,
-        end_time=calculated_end_time,
-        line_user_id=booking.line_user_id 
+        end_time=calculated_end_time
     )
     db.add(new_booking)
     db.commit()
     db.refresh(new_booking)
-    
-    if booking.line_user_id:
-        start_time_str = booking_start_time.strftime('%Y-%m-%d %H:%M')
-        msg = f"親愛的 {booking.user_name} 您好！✨\n您已成功預約：\n⏰ 時間：{start_time_str}\n\n期待您的光臨！🥰"
-        send_line_push(booking.line_user_id, msg)
 
     new_summary = f"{time_str} {booking.user_name}"
     update_google_calendar_event(target_event_id, new_summary, calculated_end_time)
@@ -349,43 +308,13 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     if not booking_to_delete:
         raise HTTPException(status_code=404, detail="找不到紀錄！")
     
-    target_line_id = booking_to_delete.line_user_id
     target_start_time = booking_to_delete.start_time
-    
     db.delete(booking_to_delete)
     db.commit()
     
     revert_google_calendar_event(target_start_time)
-    
-    if target_line_id:
-        msg = f"【預約取消通知】\n您原定於 {target_start_time.strftime('%Y-%m-%d %H:%M')} 的預約已取消成功。"
-        send_line_push(target_line_id, msg)
         
     return {"message": "成功取消預約！"}
-
-@app.get("/send-reminders")
-def send_daily_reminders(db: Session = Depends(get_db)):
-    utc_now = datetime.utcnow()
-    tw_now = utc_now + timedelta(hours=8)
-    tw_tomorrow = tw_now + timedelta(days=1)
-    start_of_tomorrow = tw_tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_of_tomorrow = start_of_tomorrow + timedelta(days=1)
-    
-    tomorrow_bookings = db.query(BookingDB).filter(
-        BookingDB.start_time >= start_of_tomorrow,
-        BookingDB.start_time < end_of_tomorrow
-    ).all()
-    
-    reminded_count = 0
-    for b in tomorrow_bookings:
-        if b.line_user_id:
-            time_str = b.start_time.strftime('%H:%M')
-            date_str = tw_tomorrow.strftime('%m/%d')
-            msg = f"【明日預約溫馨提醒】🔔\n親愛的 {b.user_name} 您好！\n提醒您明天 ({date_str}) {time_str} 有美甲預約喔！\n\n期待您的光臨！"
-            send_line_push(b.line_user_id, msg)
-            reminded_count += 1
-            
-    return {"message": f"發送了 {reminded_count} 則 LINE 提醒。"}
 
 if __name__ == "__main__":
     import uvicorn
