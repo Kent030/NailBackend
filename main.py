@@ -166,7 +166,7 @@ class BookingCreate(BaseModel):
     start_time: datetime
     line_user_id: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 絕對獨裁版")
+app = FastAPI(title="單人美甲工作室 - 圖示判斷升級版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -183,27 +183,30 @@ def get_db():
     finally:
         db.close()
 
-# ★ 核心判斷邏輯：Google 日曆就是聖旨！
+# ★ 修正核心判斷邏輯：加入符號圖示判斷
 def get_event_status(summary, start_time):
     summary = summary.strip()
     if not summary:
         return "PRIVATE"
         
-    # 1. 標題完全只有數字、冒號、點、空白 (例如 "10:00", "14：00") -> 開放預約
+    # 定義常見的符號與表情圖示範圍 (涵蓋絕大多數 emoji 與特殊符號)
+    emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]|[\u2600-\u27FF]|[\u2B00-\u2BFF]')
+    
+    # 檢查是否有文字關鍵字、是否有圖示、是否為數字(時間)開頭
+    has_keyword = any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留"])
+    has_emoji = bool(emoji_pattern.search(summary))
+    starts_with_digit = bool(re.match(r'^\d', summary))
+    
+    # 1. 判斷是否為休息：只要有休息關鍵字，或是「包含圖示且開頭不是數字(時間)」，一律當作老闆休息
+    if has_keyword or (has_emoji and not starts_with_digit):
+        return "PRIVATE"
+        
+    # 2. 標題完全只有數字、冒號、點、空白 (例如 "10:00", "14：00") -> 開放預約
     if re.fullmatch(r'^[0-9:：.\s]+$', summary):
         return "OPEN"
         
-    # 2. 開頭有時間字串，但後面有跟著字 (例如 "10:00 王小明", "10v小橘") -> 已被預約
-    t1 = start_time.strftime("%H:%M") # "09:00"
-    t2 = t1.lstrip("0")               # "9:00"
-    t3 = start_time.strftime("%H")    # "09"
-    t4 = t3.lstrip("0")               # "9"
-    
-    if summary.startswith(t1) or summary.startswith(t2) or summary.startswith(t3) or summary.startswith(t4):
-        return "BOOKED"
-        
-    # 3. 其他全中文 -> 私人休息
-    return "PRIVATE"
+    # 3. 只要不是休息，又不是純時間格式 (例如手寫的 "林小姐" 或 "10:00 王小明") -> 一律視為「已被預約」
+    return "BOOKED"
 
 
 # ==========================================
@@ -212,7 +215,7 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統已更新！採用 Google 日曆絕對獨裁防呆機制。"}
+    return {"message": "系統已更新！現在輸入圖示符號也會自動判定為休息時間。"}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -237,7 +240,6 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
                 if ge['start_time'] < datetime.now():
                     pass # 時間過了就不給約
                 else:
-                    # 無視資料庫舊資料，老闆說開放就是開放！
                     schedule_result.append({"time": time_str, "status": "可預約", "reason": ""})
             
             elif status == "BOOKED":
@@ -252,7 +254,6 @@ def get_all_bookings(db: Session = Depends(get_db)):
     google_events = get_google_calendar_events()
     result = []
     
-    # 建立行事曆當前狀態地圖
     gcal_status_map = {}
     for ge in google_events:
         gcal_status_map[ge['start_time']] = {
@@ -261,7 +262,6 @@ def get_all_bookings(db: Session = Depends(get_db)):
             "end_time": ge['end_time']
         }
     
-    # 【資料庫的訂單】：只有當 Google 日曆確實是「已被預約」狀態時，才輸出資料庫裡的客人資料 (供查詢功能使用)
     db_start_times = []
     for b in db_bookings:
         gcal_info = gcal_status_map.get(b.start_time)
@@ -277,7 +277,6 @@ def get_all_bookings(db: Session = Depends(get_db)):
                 "line_user_id": b.line_user_id
             })
             
-    # 【Google 行事曆行程】：補上那些沒有在資料庫裡的空檔、私人休息或手動填寫的預約
     fake_id = -1 
     for ge in google_events:
         if ge['start_time'] in db_start_times:
