@@ -30,7 +30,6 @@ if google_creds_str:
         print(f"Google Calendar 授權失敗: {e}")
 
 def get_google_calendar_events():
-    """抓取 Google 日曆行程 (加入全天行程判斷)"""
     if not calendar_service or not CALENDAR_ID:
         return []
     try:
@@ -50,11 +49,10 @@ def get_google_calendar_events():
         parsed_events = []
         
         for event in events:
-            summary = event.get('summary', '私人行程')
+            summary = event.get('summary', '').strip()
             start_info = event['start']
             end_info = event['end']
             
-            # ★ 判斷是不是「全天行程」(日曆上打勾全天的那種)
             if 'dateTime' in start_info:
                 start_dt = datetime.strptime(start_info['dateTime'][:19], "%Y-%m-%dT%H:%M:%S")
                 end_dt = datetime.strptime(end_info['dateTime'][:19], "%Y-%m-%dT%H:%M:%S")
@@ -77,7 +75,6 @@ def get_google_calendar_events():
         return []
 
 def update_google_calendar_event(event_id: str, new_summary: str, end_time: datetime):
-    """預約成功時：把日曆標題『10:00』改寫成『10:00 王小明』"""
     if not calendar_service or not CALENDAR_ID:
         return
     try:
@@ -91,7 +88,6 @@ def update_google_calendar_event(event_id: str, new_summary: str, end_time: date
         print(f"更新 Google 日曆失敗: {e}")
 
 def revert_google_calendar_event(start_time: datetime):
-    """取消預約時：把日曆標題恢復成純時間『10:00』，讓時段重新開放"""
     if not calendar_service or not CALENDAR_ID:
         return
     try:
@@ -100,6 +96,7 @@ def revert_google_calendar_event(start_time: datetime):
             if ge['start_time'] == start_time and not ge['is_full_day']:
                 event_id = ge['id']
                 event_obj = calendar_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+                
                 time_str = start_time.strftime("%H:%M")
                 event_obj['summary'] = time_str 
                 
@@ -168,7 +165,7 @@ class BookingCreate(BaseModel):
     start_time: datetime
     line_user_id: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 終極白名單休假版")
+app = FastAPI(title="單人美甲工作室 - 顯示開放時段版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -191,7 +188,7 @@ def get_db():
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統已加入全天店休封鎖功能！"}
+    return {"message": "系統已更新！行事曆現在會顯示可預約時段囉！"}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -203,22 +200,19 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
     db_bookings = db.query(BookingDB).all()
     google_events = get_google_calendar_events()
     
-    # ★【新規則】：如果當天有任何「全天行程」(通常是符號或休假)，整天強制不開放，不生出按鈕！
     is_day_off = any(ge for ge in google_events if ge['start_time'].date() == target_date and ge['is_full_day'])
     if is_day_off:
         return {"date": date_str, "slots": []}
     
     schedule_result = []
     for ge in google_events:
-        # 只過濾出非全天行程，且日期對得上的
         if ge['start_time'].date() == target_date and not ge['is_full_day']:
             time_str = ge['start_time'].strftime("%H:%M") 
-            summary = ge['summary'].strip()
+            summary = ge['summary']
             
-            # 標題完全等於時間 -> 開放預約
             if summary == time_str:
                 if ge['start_time'] < datetime.now():
-                    pass # 時間已過不顯示
+                    pass 
                 else:
                     is_booked = any(b for b in db_bookings if b.start_time == ge['start_time'])
                     if is_booked:
@@ -226,7 +220,6 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
                     else:
                         schedule_result.append({"time": time_str, "status": "可預約", "reason": ""})
             
-            # 標題開頭是時間，且後面有字 -> 已被預約
             elif summary.startswith(time_str) and len(summary) > len(time_str):
                 schedule_result.append({"time": time_str, "status": "不可預約", "reason": "已被預約"})
                 
@@ -254,20 +247,18 @@ def get_all_bookings(db: Session = Depends(get_db)):
     google_events = get_google_calendar_events()
     fake_id = -1 
     for ge in google_events:
-        summary = ge['summary'].strip()
+        summary = ge['summary']
         time_str = ge['start_time'].strftime("%H:%M")
         
-        # 開放時段不畫在管理員行事曆上
-        if summary == time_str and not ge['is_full_day']:
-            continue
-            
-        # 已經抓過的訂單不重複顯示
+        # 已經存在資料庫的重複訂單跳過
         if not ge['is_full_day'] and ge['start_time'] in db_start_times:
             continue
             
-        # 依照行程種類給予不同標籤
+        # ★【核心修改】將「標題 = 時間 (例如 10:00)」的狀態標記為「可預約」，不再隱藏！
         if ge['is_full_day']:
-            user_name_display = "🏖️ 店休日"  # 你的休假符號會顯示在服務名稱欄位
+            user_name_display = "🏖️ 店休日"
+        elif summary == time_str:
+            user_name_display = "✨ 可預約"
         elif summary.startswith(time_str) and len(summary) > len(time_str):
             user_name_display = "已被預約"
         else:
@@ -294,13 +285,13 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     target_event_id = None
     for ge in google_events:
         if ge['start_time'] == booking_start_time and not ge['is_full_day']:
-            summary = ge['summary'].strip()
+            summary = ge['summary']
             if summary == time_str:
                 target_event_id = ge['id']
                 break
                 
     if not target_event_id:
-        raise HTTPException(status_code=400, detail="這個時段尚未開放，或已被預約走囉！")
+        raise HTTPException(status_code=400, detail="這個時段尚未開放，或剛剛被預約走囉！")
     
     if booking.service_name not in SERVICES_MENU:
         raise HTTPException(status_code=400, detail="找不到這項服務喔！")
