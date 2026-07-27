@@ -144,29 +144,25 @@ class BookingDB(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_name = Column(String, index=True)
     user_phone = Column(String)
-    service_name = Column(String)
+    service_name = Column(String, default="美甲預約") # 預留欄位，給舊資料相容用
     start_time = Column(DateTime)
     end_time = Column(DateTime)
     line_user_id = Column(String, nullable=True) 
 
 Base.metadata.create_all(bind=engine)
 
-SERVICES_MENU = {
-    "單色凝膠": 90,
-    "造型凝膠": 120,
-    "卸甲續作": 150,
-    "純卸甲": 40
-}
+# ★ 拿掉服務項目選單，預設每個客人佔用 120 分鐘
+DEFAULT_DURATION = 120 
 BUFFER_TIME = 15 
 
+# ★ 拿掉 API 接收的 service_name 欄位
 class BookingCreate(BaseModel):
     user_name: str
     user_phone: str
-    service_name: str
     start_time: datetime
     line_user_id: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 圖示判斷升級版")
+app = FastAPI(title="單人美甲工作室 - 無服務項目極簡版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -183,29 +179,23 @@ def get_db():
     finally:
         db.close()
 
-# ★ 修正核心判斷邏輯：加入符號圖示判斷
 def get_event_status(summary, start_time):
     summary = summary.strip()
     if not summary:
         return "PRIVATE"
         
-    # 定義常見的符號與表情圖示範圍 (涵蓋絕大多數 emoji 與特殊符號)
     emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]|[\u2600-\u27FF]|[\u2B00-\u2BFF]')
     
-    # 檢查是否有文字關鍵字、是否有圖示、是否為數字(時間)開頭
     has_keyword = any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留"])
     has_emoji = bool(emoji_pattern.search(summary))
     starts_with_digit = bool(re.match(r'^\d', summary))
     
-    # 1. 判斷是否為休息：只要有休息關鍵字，或是「包含圖示且開頭不是數字(時間)」，一律當作老闆休息
     if has_keyword or (has_emoji and not starts_with_digit):
         return "PRIVATE"
         
-    # 2. 標題完全只有數字、冒號、點、空白 (例如 "10:00", "14：00") -> 開放預約
     if re.fullmatch(r'^[0-9:：.\s]+$', summary):
         return "OPEN"
         
-    # 3. 只要不是休息，又不是純時間格式 (例如手寫的 "林小姐" 或 "10:00 王小明") -> 一律視為「已被預約」
     return "BOOKED"
 
 
@@ -215,7 +205,7 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統已更新！現在輸入圖示符號也會自動判定為休息時間。"}
+    return {"message": "系統已更新！移除服務項目，預約流程極簡化。"}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -238,7 +228,7 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
             
             if status == "OPEN":
                 if ge['start_time'] < datetime.now():
-                    pass # 時間過了就不給約
+                    pass 
                 else:
                     schedule_result.append({"time": time_str, "status": "可預約", "reason": ""})
             
@@ -271,7 +261,7 @@ def get_all_bookings(db: Session = Depends(get_db)):
                 "id": b.id,
                 "user_name": b.user_name,
                 "user_phone": b.user_phone,
-                "service_name": b.service_name,
+                "service_name": "美甲預約", # 統一名稱
                 "start_time": b.start_time,
                 "end_time": b.end_time,
                 "line_user_id": b.line_user_id
@@ -297,7 +287,7 @@ def get_all_bookings(db: Session = Depends(get_db)):
             "id": fake_id,
             "user_name": user_name_display,
             "user_phone": "0000000000",
-            "service_name": ge['summary'],
+            "service_name": "美甲預約" if status == "BOOKED" else ge['summary'],
             "start_time": ge['start_time'],
             "end_time": ge['end_time'],
             "line_user_id": None
@@ -322,16 +312,13 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     if not target_event_id:
         raise HTTPException(status_code=400, detail="這個時段尚未開放，或剛剛被預約走囉！")
     
-    if booking.service_name not in SERVICES_MENU:
-        raise HTTPException(status_code=400, detail="找不到這項服務喔！")
-
-    duration = SERVICES_MENU[booking.service_name]
-    calculated_end_time = booking_start_time + timedelta(minutes=(duration + BUFFER_TIME))
+    # ★ 統一預約長度計算
+    calculated_end_time = booking_start_time + timedelta(minutes=(DEFAULT_DURATION + BUFFER_TIME))
 
     new_booking = BookingDB(
         user_name=booking.user_name,
         user_phone=booking.user_phone,
-        service_name=booking.service_name,
+        service_name="美甲預約",
         start_time=booking_start_time,
         end_time=calculated_end_time,
         line_user_id=booking.line_user_id 
@@ -342,7 +329,8 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     
     if booking.line_user_id:
         start_time_str = booking_start_time.strftime('%Y-%m-%d %H:%M')
-        msg = f"親愛的 {booking.user_name} 您好！✨\n您已成功預約美甲服務：\n💅 項目：{booking.service_name}\n⏰ 時間：{start_time_str}\n\n期待您的光臨！🥰"
+        # ★ LINE 推播拿掉服務項目
+        msg = f"親愛的 {booking.user_name} 您好！✨\n您已成功預約：\n⏰ 時間：{start_time_str}\n\n期待您的光臨！🥰"
         send_line_push(booking.line_user_id, msg)
 
     new_summary = f"{time_str} {booking.user_name}"
@@ -391,7 +379,8 @@ def send_daily_reminders(db: Session = Depends(get_db)):
         if b.line_user_id:
             time_str = b.start_time.strftime('%H:%M')
             date_str = tw_tomorrow.strftime('%m/%d')
-            msg = f"【明日預約溫馨提醒】🔔\n親愛的 {b.user_name} 您好！\n提醒您明天 ({date_str}) {time_str} 有預約美甲服務：\n💅 項目：{b.service_name}\n\n期待您的光臨！"
+            # ★ 提醒推播也拿掉服務項目
+            msg = f"【明日預約溫馨提醒】🔔\n親愛的 {b.user_name} 您好！\n提醒您明天 ({date_str}) {time_str} 有美甲預約喔！\n\n期待您的光臨！"
             send_line_push(b.line_user_id, msg)
             reminded_count += 1
             
