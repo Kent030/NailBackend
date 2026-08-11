@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from datetime import datetime, timedelta
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
 # ==========================================
@@ -74,12 +74,15 @@ def get_google_calendar_events():
         print(f"讀取 Google 日曆失敗: {e}")
         return []
 
-def update_google_calendar_event(event_id: str, new_summary: str, end_time: datetime):
+# ★ 新增 description 參數，用來寫入客人的詳細資訊
+def update_google_calendar_event(event_id: str, new_summary: str, end_time: datetime, description: str = ""):
     if not calendar_service or not CALENDAR_ID:
         return
     try:
         event_obj = calendar_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
         event_obj['summary'] = new_summary 
+        event_obj['description'] = description  # 將詳細資訊寫入日曆備註欄
+        
         if 'dateTime' in event_obj['end']:
             event_obj['end']['dateTime'] = end_time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
             event_obj['end']['timeZone'] = 'Asia/Taipei'
@@ -99,6 +102,7 @@ def revert_google_calendar_event(start_time: datetime):
                 
                 time_str = start_time.strftime("%H:%M")
                 event_obj['summary'] = time_str 
+                event_obj['description'] = "" # ★ 取消預約時，順便把備註清空
                 
                 default_end = start_time + timedelta(hours=1)
                 if 'dateTime' in event_obj['end']:
@@ -122,10 +126,25 @@ class BookingDB(Base):
     user_name = Column(String, index=True)
     user_phone = Column(String)
     service_name = Column(String, default="美甲預約") 
+    service_type = Column(String, nullable=True)     
+    remittance_last_5 = Column(String, nullable=True) 
     start_time = Column(DateTime)
     end_time = Column(DateTime)
 
 Base.metadata.create_all(bind=engine)
+
+def upgrade_db_schema():
+    db = SessionLocal()
+    try:
+        db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_type VARCHAR;"))
+        db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS remittance_last_5 VARCHAR;"))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        pass
+    finally:
+        db.close()
+upgrade_db_schema()
 
 DEFAULT_DURATION = 120 
 BUFFER_TIME = 15 
@@ -133,9 +152,11 @@ BUFFER_TIME = 15
 class BookingCreate(BaseModel):
     user_name: str
     user_phone: str
+    service_type: str
+    remittance_last_5: str
     start_time: datetime
 
-app = FastAPI(title="單人美甲工作室 - 純網頁極簡版")
+app = FastAPI(title="單人美甲工作室 - 行事曆詳盡資訊版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -176,7 +197,7 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統運行中：無 LINE 純網頁預約版本。"}
+    return {"message": "系統運行中：已支援將詳細資訊寫入 Google 行事曆。"}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -232,7 +253,9 @@ def get_all_bookings(db: Session = Depends(get_db)):
                 "id": b.id,
                 "user_name": b.user_name,
                 "user_phone": b.user_phone,
-                "service_name": "美甲預約",
+                "service_name": b.service_name,
+                "service_type": b.service_type,             
+                "remittance_last_5": b.remittance_last_5,   
                 "start_time": b.start_time,
                 "end_time": b.end_time
             })
@@ -287,6 +310,8 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
         user_name=booking.user_name,
         user_phone=booking.user_phone,
         service_name="美甲預約",
+        service_type=booking.service_type,           
+        remittance_last_5=booking.remittance_last_5, 
         start_time=booking_start_time,
         end_time=calculated_end_time
     )
@@ -294,8 +319,20 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_booking)
 
-    new_summary = f"{time_str} {booking.user_name}"
-    update_google_calendar_event(target_event_id, new_summary, calculated_end_time)
+    # ★ 組合新的標題與日曆備註內容
+    # 標題會變成： 10:00 王小明 (手部) 末5:12345
+    new_summary = f"{time_str} {booking.user_name} ({booking.service_type}) 末5:{booking.remittance_last_5}"
+    
+    # 點進去日曆看到的詳細內容
+    new_description = (
+        f"📱 聯絡電話：{booking.user_phone}\n"
+        f"💅 預約部位：{booking.service_type}\n"
+        f"💰 匯款末五碼：{booking.remittance_last_5}\n"
+        f"⏳ 系統自動保留時間：{DEFAULT_DURATION} 分鐘"
+    )
+
+    # 寫入 Google 日曆
+    update_google_calendar_event(target_event_id, new_summary, calculated_end_time, new_description)
     
     return {
         "message": "預約成功！", 
