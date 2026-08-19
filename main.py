@@ -1,6 +1,7 @@
 import os 
 import json 
 import re
+import calendar 
 from google.oauth2 import service_account 
 from googleapiclient.discovery import build 
 
@@ -74,14 +75,13 @@ def get_google_calendar_events():
         print(f"讀取 Google 日曆失敗: {e}")
         return []
 
-# ★ 新增 description 參數，用來寫入客人的詳細資訊
 def update_google_calendar_event(event_id: str, new_summary: str, end_time: datetime, description: str = ""):
     if not calendar_service or not CALENDAR_ID:
         return
     try:
         event_obj = calendar_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
         event_obj['summary'] = new_summary 
-        event_obj['description'] = description  # 將詳細資訊寫入日曆備註欄
+        event_obj['description'] = description  
         
         if 'dateTime' in event_obj['end']:
             event_obj['end']['dateTime'] = end_time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
@@ -102,7 +102,7 @@ def revert_google_calendar_event(start_time: datetime):
                 
                 time_str = start_time.strftime("%H:%M")
                 event_obj['summary'] = time_str 
-                event_obj['description'] = "" # ★ 取消預約時，順便把備註清空
+                event_obj['description'] = "" 
                 
                 default_end = start_time + timedelta(hours=1)
                 if 'dateTime' in event_obj['end']:
@@ -111,6 +111,31 @@ def revert_google_calendar_event(start_time: datetime):
                 break
     except Exception as e:
         print(f"恢復 Google 日曆失敗: {e}")
+
+# ==========================================
+# ★ VIP 終極檢查大腦
+# ==========================================
+def check_is_vip(user_phone: str) -> bool:
+    if not calendar_service or not CALENDAR_ID or not user_phone:
+        return False
+    try:
+        events_result = calendar_service.events().list(
+            calendarId=CALENDAR_ID, 
+            q=user_phone, 
+            maxResults=30, 
+            singleEvents=True
+        ).execute()
+        
+        events = events_result.get('items', [])
+        for event in events:
+            summary = event.get('summary', '').strip()
+            # 支援各種 V 寫法的正則表達式，且不誤判 Vivian 等英文名字
+            if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
+                return True
+        return False
+    except Exception as e:
+        print(f"VIP 查詢失敗: {e}")
+        return False
 
 # ==========================================
 # 1. 資料庫設定
@@ -156,7 +181,7 @@ class BookingCreate(BaseModel):
     remittance_last_5: str
     start_time: datetime
 
-app = FastAPI(title="單人美甲工作室 - 行事曆詳盡資訊版")
+app = FastAPI(title="單人美甲工作室 - 終極 PWA VIP 版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -197,7 +222,7 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統運行中：已支援將詳細資訊寫入 Google 行事曆。"}
+    return {"message": "系統運行中：全面支援各種 V 寫法的 VIP 客戶判別！無 LINE 純網頁版。"}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -293,6 +318,26 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     booking_start_time = booking.start_time.replace(tzinfo=None)
     time_str = booking_start_time.strftime("%H:%M")
     
+    user_phone = booking.user_phone.strip()
+    is_vip = check_is_vip(user_phone)
+    
+    now = datetime.now()
+    if now.month == 12:
+        max_year = now.year + 1
+        max_month = 1
+    else:
+        max_year = now.year
+        max_month = now.month + 1
+        
+    last_day = calendar.monthrange(max_year, max_month)[1]
+    max_allowed_date = datetime(max_year, max_month, last_day, 23, 59, 59)
+    
+    if booking_start_time > max_allowed_date and not is_vip:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"此時段目前僅開放給 VIP 熟客優先預約！一般客人目前僅開放至 {max_month} 月底喔！"
+        )
+    
     google_events = get_google_calendar_events()
     target_event_id = None
     for ge in google_events:
@@ -308,7 +353,7 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
 
     new_booking = BookingDB(
         user_name=booking.user_name,
-        user_phone=booking.user_phone,
+        user_phone=user_phone,
         service_name="美甲預約",
         service_type=booking.service_type,           
         remittance_last_5=booking.remittance_last_5, 
@@ -319,19 +364,17 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(new_booking)
 
-    # ★ 組合新的標題與日曆備註內容
-    # 標題會變成： 10:00 王小明 (手部) 末5:12345
-    new_summary = f"{time_str} {booking.user_name} ({booking.service_type}) 末5:{booking.remittance_last_5}"
+    vip_prefix = "V " if is_vip else ""
+    new_summary = f"{vip_prefix}{time_str} {booking.user_name} ({booking.service_type}) 末5:{booking.remittance_last_5}"
     
-    # 點進去日曆看到的詳細內容
     new_description = (
-        f"📱 聯絡電話：{booking.user_phone}\n"
+        f"📱 聯絡電話：{user_phone}\n"
         f"💅 預約部位：{booking.service_type}\n"
         f"💰 匯款末五碼：{booking.remittance_last_5}\n"
+        f"👑 VIP 客戶：{'是' if is_vip else '否'}\n"
         f"⏳ 系統自動保留時間：{DEFAULT_DURATION} 分鐘"
     )
 
-    # 寫入 Google 日曆
     update_google_calendar_event(target_event_id, new_summary, calculated_end_time, new_description)
     
     return {
