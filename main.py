@@ -112,9 +112,6 @@ def revert_google_calendar_event(start_time: datetime):
     except Exception as e:
         print(f"恢復 Google 日曆失敗: {e}")
 
-# ==========================================
-# ★ VIP 終極檢查大腦
-# ==========================================
 def check_is_vip(user_phone: str) -> bool:
     if not calendar_service or not CALENDAR_ID or not user_phone:
         return False
@@ -129,7 +126,6 @@ def check_is_vip(user_phone: str) -> bool:
         events = events_result.get('items', [])
         for event in events:
             summary = event.get('summary', '').strip()
-            # 支援各種 V 寫法的正則表達式，且不誤判 Vivian 等英文名字
             if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
                 return True
         return False
@@ -181,7 +177,7 @@ class BookingCreate(BaseModel):
     remittance_last_5: str
     start_time: datetime
 
-app = FastAPI(title="單人美甲工作室 - 終極 PWA VIP 版")
+app = FastAPI(title="單人美甲工作室 - VIP 隱藏解鎖版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -222,7 +218,13 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統運行中：全面支援各種 V 寫法的 VIP 客戶判別！無 LINE 純網頁版。"}
+    return {"message": "系統運行中：VIP 隱藏解鎖機制已上線！"}
+
+# ★ 新增：專門給前端偷偷檢查 VIP 身分的 API
+@app.get("/check-vip/{phone}")
+def api_check_vip(phone: str):
+    is_vip = check_is_vip(phone.strip())
+    return {"is_vip": is_vip}
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -335,7 +337,8 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     if booking_start_time > max_allowed_date and not is_vip:
         raise HTTPException(
             status_code=400, 
-            detail=f"此時段目前僅開放給 VIP 熟客優先預約！一般客人目前僅開放至 {max_month} 月底喔！"
+            # ★ 委婉的阻擋訊息，不提到 VIP
+            detail=f"目前僅開放預約至 {max_month} 月底喔！後續月份將於日後陸續開放，敬請見諒。"
         )
     
     google_events = get_google_calendar_events()
