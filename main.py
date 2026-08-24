@@ -112,26 +112,6 @@ def revert_google_calendar_event(start_time: datetime):
     except Exception as e:
         print(f"恢復 Google 日曆失敗: {e}")
 
-def check_is_vip(user_phone: str) -> bool:
-    if not calendar_service or not CALENDAR_ID or not user_phone:
-        return False
-    try:
-        events_result = calendar_service.events().list(
-            calendarId=CALENDAR_ID, 
-            q=user_phone, 
-            maxResults=30, 
-            singleEvents=True
-        ).execute()
-        
-        events = events_result.get('items', [])
-        for event in events:
-            summary = event.get('summary', '').strip()
-            if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
-                return True
-        return False
-    except Exception as e:
-        print(f"VIP 查詢失敗: {e}")
-        return False
 
 # ==========================================
 # 1. 資料庫設定
@@ -152,6 +132,13 @@ class BookingDB(Base):
     start_time = Column(DateTime)
     end_time = Column(DateTime)
 
+# ★ 新增：VIP 專屬資料庫
+class VipDB(Base):
+    __tablename__ = "vips"
+    id = Column(Integer, primary_key=True, index=True)
+    user_name = Column(String)
+    user_phone = Column(String, unique=True, index=True)
+
 Base.metadata.create_all(bind=engine)
 
 def upgrade_db_schema():
@@ -169,6 +156,7 @@ upgrade_db_schema()
 
 DEFAULT_DURATION = 120 
 BUFFER_TIME = 15 
+BOSS_PWD = "8888" # ★ 老闆的隱藏後台密碼，可以在這邊修改
 
 class BookingCreate(BaseModel):
     user_name: str
@@ -177,7 +165,11 @@ class BookingCreate(BaseModel):
     remittance_last_5: str
     start_time: datetime
 
-app = FastAPI(title="單人美甲工作室 - VIP 隱藏解鎖版")
+class VipCreate(BaseModel):
+    user_name: str
+    user_phone: str
+
+app = FastAPI(title="單人美甲工作室 - VIP 專屬後台版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -194,23 +186,56 @@ def get_db():
     finally:
         db.close()
 
+# ==========================================
+# ★ VIP 終極檢查大腦 (結合資料庫與日曆)
+# ==========================================
+def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
+    if not user_phone: return False
+    
+    # 1. 先查 VIP 資料庫有沒有他
+    existing_vip = db.query(VipDB).filter(VipDB.user_phone == user_phone).first()
+    if existing_vip:
+        # 如果當初是自動建檔沒有名字，順便幫他補上名字
+        if existing_vip.user_name == "VIP客戶" and user_name != "VIP客戶":
+            existing_vip.user_name = user_name
+            db.commit()
+        return True
+        
+    # 2. 資料庫沒有？去翻 Google 日曆找 V
+    if not calendar_service or not CALENDAR_ID: return False
+    try:
+        events_result = calendar_service.events().list(
+            calendarId=CALENDAR_ID, q=user_phone, maxResults=30, singleEvents=True
+        ).execute()
+        
+        events = events_result.get('items', [])
+        for event in events:
+            summary = event.get('summary', '').strip()
+            if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
+                # 找到了！自動寫入資料庫，以後就不用再查日曆了！
+                new_vip = VipDB(user_name=user_name, user_phone=user_phone)
+                db.add(new_vip)
+                db.commit()
+                return True
+        return False
+    except Exception as e:
+        print(f"VIP 查詢失敗: {e}")
+        return False
+
 def get_event_status(summary, start_time):
     summary = summary.strip()
     if not summary:
         return "PRIVATE"
-        
     has_keyword = any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留"])
     if has_keyword:
         return "PRIVATE"
-        
     if re.fullmatch(r'^[0-9:：.\s]+$', summary):
         return "OPEN"
-        
     has_text = bool(re.search(r'[a-zA-Z0-9\u4e00-\u9fa5]', summary))
     if not has_text:
         return "PRIVATE"
-        
     return "BOOKED"
+
 
 # ==========================================
 # 4. API 路由 (Endpoints)
@@ -218,13 +243,46 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統運行中：VIP 隱藏解鎖機制已上線！"}
+    return {"message": "系統運行中：VIP 資料庫與老闆專屬後台已上線！"}
 
-# ★ 新增：專門給前端偷偷檢查 VIP 身分的 API
+# ★ VIP 前端檢查接口
 @app.get("/check-vip/{phone}")
-def api_check_vip(phone: str):
-    is_vip = check_is_vip(phone.strip())
+def api_check_vip(phone: str, db: Session = Depends(get_db)):
+    is_vip = check_is_vip(phone.strip(), "VIP客戶", db)
     return {"is_vip": is_vip}
+
+# ==========================================
+# ★ 老闆專屬 VIP 管理 API
+# ==========================================
+@app.get("/api/vips")
+def get_vips(pwd: str, db: Session = Depends(get_db)):
+    if pwd != BOSS_PWD:
+        raise HTTPException(status_code=401, detail="密碼錯誤")
+    return db.query(VipDB).all()
+
+@app.post("/api/vips")
+def add_vip(vip: VipCreate, pwd: str, db: Session = Depends(get_db)):
+    if pwd != BOSS_PWD:
+        raise HTTPException(status_code=401, detail="密碼錯誤")
+    exist = db.query(VipDB).filter(VipDB.user_phone == vip.user_phone).first()
+    if exist:
+        raise HTTPException(status_code=400, detail="此電話已經在 VIP 名單囉！")
+    new_vip = VipDB(user_name=vip.user_name, user_phone=vip.user_phone)
+    db.add(new_vip)
+    db.commit()
+    return {"message": "新增 VIP 成功！"}
+
+@app.delete("/api/vips/{phone}")
+def delete_vip(phone: str, pwd: str, db: Session = Depends(get_db)):
+    if pwd != BOSS_PWD:
+        raise HTTPException(status_code=401, detail="密碼錯誤")
+    vip = db.query(VipDB).filter(VipDB.user_phone == phone).first()
+    if not vip:
+        raise HTTPException(status_code=404, detail="找不到此 VIP")
+    db.delete(vip)
+    db.commit()
+    return {"message": "已移除 VIP 資格"}
+
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
@@ -234,7 +292,6 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="日期格式錯誤")
 
     google_events = get_google_calendar_events()
-    
     is_day_off = any(ge for ge in google_events if ge['start_time'].date() == target_date and ge['is_full_day'])
     if is_day_off:
         return {"date": date_str, "slots": []}
@@ -250,7 +307,6 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
                     pass 
                 else:
                     schedule_result.append({"time": time_str, "status": "可預約", "reason": ""})
-            
             elif status == "BOOKED":
                 schedule_result.append({"time": time_str, "status": "不可預約", "reason": "已被預約"})
                 
@@ -291,9 +347,7 @@ def get_all_bookings(db: Session = Depends(get_db)):
     for ge in google_events:
         if ge['start_time'] in db_start_times:
             continue
-            
         status = gcal_status_map[ge['start_time']]["status"]
-        
         if status == "FULL_DAY":
             user_name_display = "🏖️ 店休日"
         elif status == "OPEN":
@@ -312,7 +366,6 @@ def get_all_bookings(db: Session = Depends(get_db)):
             "end_time": ge['end_time']
         })
         fake_id -= 1
-        
     return result
 
 @app.post("/bookings")
@@ -321,7 +374,7 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     time_str = booking_start_time.strftime("%H:%M")
     
     user_phone = booking.user_phone.strip()
-    is_vip = check_is_vip(user_phone)
+    is_vip = check_is_vip(user_phone, booking.user_name, db)
     
     now = datetime.now()
     if now.month == 12:
@@ -337,7 +390,6 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     if booking_start_time > max_allowed_date and not is_vip:
         raise HTTPException(
             status_code=400, 
-            # ★ 委婉的阻擋訊息，不提到 VIP
             detail=f"目前僅開放預約至 {max_month} 月底喔！後續月份將於日後陸續開放，敬請見諒。"
         )
     
@@ -396,7 +448,6 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     db.commit()
     
     revert_google_calendar_event(target_start_time)
-        
     return {"message": "成功取消預約！"}
 
 if __name__ == "__main__":
