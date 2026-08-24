@@ -132,11 +132,12 @@ class BookingDB(Base):
     start_time = Column(DateTime)
     end_time = Column(DateTime)
 
+# ★ 稍微調整資料庫：允許 user_phone 為空，以便先建立沒有電話的 VIP
 class VipDB(Base):
     __tablename__ = "vips"
     id = Column(Integer, primary_key=True, index=True)
     user_name = Column(String)
-    user_phone = Column(String, unique=True, index=True)
+    user_phone = Column(String, nullable=True) 
 
 Base.metadata.create_all(bind=engine)
 
@@ -145,6 +146,7 @@ def upgrade_db_schema():
     try:
         db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_type VARCHAR;"))
         db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS remittance_last_5 VARCHAR;"))
+        # 若之前設定為 unique，這裡為了容錯不再強制檢查 (有需要可手動在 DB 端移除 unique index)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -166,9 +168,9 @@ class BookingCreate(BaseModel):
 
 class VipCreate(BaseModel):
     user_name: str
-    user_phone: str
+    user_phone: Optional[str] = None # ★ 修改：老闆手動新增時，電話變成選填
 
-app = FastAPI(title="單人美甲工作室 - 終極 VIP 雷達版")
+app = FastAPI(title="單人美甲工作室 - 自動補完電話版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -185,30 +187,73 @@ def get_db():
     finally:
         db.close()
 
+# ★ 名字清理魔法：去掉括號與後續文字
+def clean_vip_name(raw_name: str) -> str:
+    # 例如把 "王小明 (手部) 末5" 切割成 "王小明"
+    return raw_name.split("(")[0].strip()
+
+# ★ 升級版的 VIP 檢查大腦
 def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
-    if not user_phone: return False
+    cleaned_input_name = clean_vip_name(user_name)
     
-    existing_vip = db.query(VipDB).filter(VipDB.user_phone == user_phone).first()
-    if existing_vip:
-        if existing_vip.user_name == "VIP客戶" and user_name != "VIP客戶":
-            existing_vip.user_name = user_name
-            db.commit()
-        return True
-        
+    # 1. 優先用「電話」查資料庫
+    if user_phone:
+        existing_vip_by_phone = db.query(VipDB).filter(VipDB.user_phone == user_phone).first()
+        if existing_vip_by_phone:
+            # 如果發現名字有括號，順便清理一下
+            clean_db_name = clean_vip_name(existing_vip_by_phone.user_name)
+            if existing_vip_by_phone.user_name != clean_db_name:
+                existing_vip_by_phone.user_name = clean_db_name
+                db.commit()
+                
+            if existing_vip_by_phone.user_name == "VIP客戶" and cleaned_input_name != "VIP客戶":
+                existing_vip_by_phone.user_name = cleaned_input_name
+                db.commit()
+            return True
+            
+    # 2. 如果電話查不到，試著用「乾淨的名字」查 (為了那些當初只有建名字沒有電話的 VIP)
+    if cleaned_input_name != "VIP客戶":
+        all_vips = db.query(VipDB).all()
+        for vip in all_vips:
+            if clean_vip_name(vip.user_name) == cleaned_input_name:
+                # 找到了！且他沒有留電話？太好了，趁現在幫他補上！
+                if not vip.user_phone and user_phone:
+                    vip.user_phone = user_phone
+                    db.commit()
+                    print(f"已自動幫 VIP {cleaned_input_name} 補上電話：{user_phone}")
+                return True
+                
+    # 3. 如果資料庫真的沒有，再去翻 Google 日曆找 V
     if not calendar_service or not CALENDAR_ID: return False
     try:
+        # 先用電話搜
         events_result = calendar_service.events().list(
             calendarId=CALENDAR_ID, q=user_phone, maxResults=30, singleEvents=True
         ).execute()
-        
         events = events_result.get('items', [])
         for event in events:
             summary = event.get('summary', '').strip()
             if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
-                new_vip = VipDB(user_name=user_name, user_phone=user_phone)
+                new_vip = VipDB(user_name=cleaned_input_name, user_phone=user_phone)
                 db.add(new_vip)
                 db.commit()
                 return True
+                
+        # 電話搜不到？再用名字去日曆搜搜看
+        if cleaned_input_name != "VIP客戶":
+            events_result_name = calendar_service.events().list(
+                calendarId=CALENDAR_ID, q=cleaned_input_name, maxResults=30, singleEvents=True
+            ).execute()
+            events_name = events_result_name.get('items', [])
+            for event in events_name:
+                summary = event.get('summary', '').strip()
+                if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
+                    # 找到了！存入乾淨的名字和剛拿到的電話
+                    new_vip = VipDB(user_name=cleaned_input_name, user_phone=user_phone)
+                    db.add(new_vip)
+                    db.commit()
+                    return True
+                    
         return False
     except Exception as e:
         print(f"VIP 查詢失敗: {e}")
@@ -234,48 +279,71 @@ def get_event_status(summary, start_time):
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統運行中：VIP 資料庫與終極雷達掃描功能已上線！"}
+    return {"message": "系統運行中：名字過濾與無電話補完機制上線！"}
 
+# ★ 前端解鎖檢查時，現在會傳名字進來比對了
 @app.get("/check-vip/{phone}")
-def api_check_vip(phone: str, db: Session = Depends(get_db)):
-    is_vip = check_is_vip(phone.strip(), "VIP客戶", db)
+def api_check_vip(phone: str, name: str = "VIP客戶", db: Session = Depends(get_db)):
+    is_vip = check_is_vip(phone.strip(), name.strip(), db)
     return {"is_vip": is_vip}
 
 @app.get("/api/vips")
 def get_vips(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
         raise HTTPException(status_code=401, detail="密碼錯誤")
-    return db.query(VipDB).all()
+    
+    # 回傳給老闆前，再一次確保名字乾淨
+    vips = db.query(VipDB).all()
+    result = []
+    for v in vips:
+        clean_name = clean_vip_name(v.user_name)
+        result.append({
+            "user_name": clean_name,
+            "user_phone": v.user_phone if v.user_phone else "尚未提供電話"
+        })
+    return result
 
 @app.post("/api/vips")
 def add_vip(vip: VipCreate, pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
         raise HTTPException(status_code=401, detail="密碼錯誤")
     
-    clean_phone = re.sub(r'\D', '', vip.user_phone)
-    if not clean_phone:
-        raise HTTPException(status_code=400, detail="電話格式錯誤")
-
-    exist = db.query(VipDB).filter(VipDB.user_phone == clean_phone).first()
-    if exist:
-        raise HTTPException(status_code=400, detail="此電話已經在 VIP 名單囉！")
-    new_vip = VipDB(user_name=vip.user_name, user_phone=clean_phone)
+    clean_name = clean_vip_name(vip.user_name)
+    clean_phone = None
+    
+    if vip.user_phone:
+        clean_phone = re.sub(r'\D', '', vip.user_phone)
+        exist = db.query(VipDB).filter(VipDB.user_phone == clean_phone).first()
+        if exist:
+            raise HTTPException(status_code=400, detail="此電話已經在 VIP 名單囉！")
+            
+    # ★ 即使沒有電話，只要有名字一樣可以新增入庫
+    new_vip = VipDB(user_name=clean_name, user_phone=clean_phone)
     db.add(new_vip)
     db.commit()
-    return {"message": "新增 VIP 成功！"}
+    return {"message": "新增 VIP 成功！若未填電話，系統將於客人下次預約時自動補上。"}
 
-@app.delete("/api/vips/{phone}")
-def delete_vip(phone: str, pwd: str, db: Session = Depends(get_db)):
+@app.delete("/api/vips/{name}")
+def delete_vip(name: str, pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
         raise HTTPException(status_code=401, detail="密碼錯誤")
-    vip = db.query(VipDB).filter(VipDB.user_phone == phone).first()
-    if not vip:
+        
+    # 因為電話可能為空，所以我們改用「乾淨名字」來刪除
+    target_name = clean_vip_name(name)
+    all_vips = db.query(VipDB).all()
+    deleted = False
+    
+    for v in all_vips:
+        if clean_vip_name(v.user_name) == target_name:
+            db.delete(v)
+            deleted = True
+            
+    if not deleted:
         raise HTTPException(status_code=404, detail="找不到此 VIP")
-    db.delete(vip)
+        
     db.commit()
     return {"message": "已移除 VIP 資格"}
 
-# ★ 強化的掃描功能
 @app.post("/api/sync-vips")
 def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
@@ -284,7 +352,6 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Google API 尚未設定")
 
     try:
-        # 往前抓 1 年的資料
         one_year_ago = (datetime.now() - timedelta(days=365)).isoformat() + 'Z'
         events_result = calendar_service.events().list(
             calendarId=CALENDAR_ID, 
@@ -301,33 +368,38 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
             summary = event.get('summary', '').strip()
             desc = event.get('description', '')
             
-            # 如果發現 V
             if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
                 
-                # 結合標題與備註一起搜找電話 (允許有空白或橫線，例如 0912-345-678 或 0912 345 678)
+                # 抓名字並馬上清理乾淨
+                name_match = re.search(r'[vV]\s*([^\d\(\)\-\s]+)', summary)
+                raw_name = name_match.group(1).strip() if name_match else "VIP客戶"
+                clean_name = clean_vip_name(raw_name)
+                
                 combined_text = summary + " " + desc
                 phone_match = re.search(r'09\d{2}[-\s]?\d{3}[-\s]?\d{3}', combined_text)
                 
                 if phone_match:
                     raw_phone = phone_match.group(0)
-                    clean_phone = re.sub(r'\D', '', raw_phone) # 清除多餘符號只留數字
-                    
-                    name_match = re.search(r'[vV]\s*([^\d\(\)\-\s]+)', summary)
-                    name = name_match.group(1).strip() if name_match else "VIP客戶"
+                    clean_phone = re.sub(r'\D', '', raw_phone) 
                     
                     exist = db.query(VipDB).filter(VipDB.user_phone == clean_phone).first()
                     if not exist:
-                        new_vip = VipDB(user_name=name, user_phone=clean_phone)
+                        new_vip = VipDB(user_name=clean_name, user_phone=clean_phone)
                         db.add(new_vip)
                         added_count += 1
                 else:
-                    missed_phone_count += 1
+                    # ★ 就算沒電話，名字乾淨，也先幫他建檔！
+                    all_vips = db.query(VipDB).all()
+                    already_exist = any(clean_vip_name(v.user_name) == clean_name for v in all_vips)
+                    if not already_exist and clean_name != "VIP客戶":
+                         new_vip = VipDB(user_name=clean_name, user_phone=None)
+                         db.add(new_vip)
+                         added_count += 1
+                    else:
+                        missed_phone_count += 1
                         
         db.commit()
-        msg = f"同步完成！自動新增了 {added_count} 位 VIP。"
-        if missed_phone_count > 0:
-            msg += f"\n(備註：有 {missed_phone_count} 筆行程雖然有 V，但在日曆上找不到 09 開頭的電話號碼，系統無法自動加入，需請您手動新增喔！)"
-            
+        msg = f"同步完成！自動清理並新增了 {added_count} 位 VIP。"
         return {"message": msg}
         
     except Exception as e:
