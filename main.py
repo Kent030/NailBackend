@@ -69,7 +69,7 @@ def get_google_calendar_events(max_results=500):
                 "start_time": start_dt,
                 "end_time": end_dt,
                 "is_full_day": is_full_day,
-                "description": event.get('description', '') # 抓取備註
+                "description": event.get('description', '') 
             })
         return parsed_events
     except Exception as e:
@@ -168,7 +168,7 @@ class VipCreate(BaseModel):
     user_name: str
     user_phone: str
 
-app = FastAPI(title="單人美甲工作室 - VIP 專屬後台與同步版")
+app = FastAPI(title="單人美甲工作室 - 終極 VIP 雷達版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -228,23 +228,19 @@ def get_event_status(summary, start_time):
         return "PRIVATE"
     return "BOOKED"
 
-
 # ==========================================
 # 4. API 路由 (Endpoints)
 # ==========================================
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統運行中：VIP 資料庫與同步功能已上線！"}
+    return {"message": "系統運行中：VIP 資料庫與終極雷達掃描功能已上線！"}
 
 @app.get("/check-vip/{phone}")
 def api_check_vip(phone: str, db: Session = Depends(get_db)):
     is_vip = check_is_vip(phone.strip(), "VIP客戶", db)
     return {"is_vip": is_vip}
 
-# ==========================================
-# ★ 老闆專屬 VIP 管理 API
-# ==========================================
 @app.get("/api/vips")
 def get_vips(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
@@ -255,10 +251,15 @@ def get_vips(pwd: str, db: Session = Depends(get_db)):
 def add_vip(vip: VipCreate, pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
         raise HTTPException(status_code=401, detail="密碼錯誤")
-    exist = db.query(VipDB).filter(VipDB.user_phone == vip.user_phone).first()
+    
+    clean_phone = re.sub(r'\D', '', vip.user_phone)
+    if not clean_phone:
+        raise HTTPException(status_code=400, detail="電話格式錯誤")
+
+    exist = db.query(VipDB).filter(VipDB.user_phone == clean_phone).first()
     if exist:
         raise HTTPException(status_code=400, detail="此電話已經在 VIP 名單囉！")
-    new_vip = VipDB(user_name=vip.user_name, user_phone=vip.user_phone)
+    new_vip = VipDB(user_name=vip.user_name, user_phone=clean_phone)
     db.add(new_vip)
     db.commit()
     return {"message": "新增 VIP 成功！"}
@@ -274,58 +275,64 @@ def delete_vip(phone: str, pwd: str, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "已移除 VIP 資格"}
 
-# ★ 新增：一鍵掃描 Google 日曆同步 VIP
+# ★ 強化的掃描功能
 @app.post("/api/sync-vips")
 def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
         raise HTTPException(status_code=401, detail="密碼錯誤")
-        
     if not calendar_service or not CALENDAR_ID:
         raise HTTPException(status_code=500, detail="Google API 尚未設定")
 
     try:
-        # 往前抓取半年的資料來掃描
-        half_year_ago = (datetime.now() - timedelta(days=180)).isoformat() + 'Z'
+        # 往前抓 1 年的資料
+        one_year_ago = (datetime.now() - timedelta(days=365)).isoformat() + 'Z'
         events_result = calendar_service.events().list(
             calendarId=CALENDAR_ID, 
-            timeMin=half_year_ago,
-            maxResults=1000, 
+            timeMin=one_year_ago,
+            maxResults=2000, 
             singleEvents=True
         ).execute()
         
         events = events_result.get('items', [])
         added_count = 0
+        missed_phone_count = 0
         
         for event in events:
             summary = event.get('summary', '').strip()
             desc = event.get('description', '')
             
-            # 檢查標題是否有 V
+            # 如果發現 V
             if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
                 
-                # 嘗試從備註欄 (description) 挖出電話號碼
-                phone_match = re.search(r'(09\d{8})', desc)
-                phone = phone_match.group(1) if phone_match else None
+                # 結合標題與備註一起搜找電話 (允許有空白或橫線，例如 0912-345-678 或 0912 345 678)
+                combined_text = summary + " " + desc
+                phone_match = re.search(r'09\d{2}[-\s]?\d{3}[-\s]?\d{3}', combined_text)
                 
-                # 如果備註沒有，嘗試從標題挖出名字
-                name_match = re.search(r'[vV]\s*(\D+)', summary)
-                name = name_match.group(1).strip() if name_match else "VIP客戶"
-                
-                if phone:
-                    # 檢查資料庫有沒有，沒有才加
-                    exist = db.query(VipDB).filter(VipDB.user_phone == phone).first()
+                if phone_match:
+                    raw_phone = phone_match.group(0)
+                    clean_phone = re.sub(r'\D', '', raw_phone) # 清除多餘符號只留數字
+                    
+                    name_match = re.search(r'[vV]\s*([^\d\(\)\-\s]+)', summary)
+                    name = name_match.group(1).strip() if name_match else "VIP客戶"
+                    
+                    exist = db.query(VipDB).filter(VipDB.user_phone == clean_phone).first()
                     if not exist:
-                        new_vip = VipDB(user_name=name, user_phone=phone)
+                        new_vip = VipDB(user_name=name, user_phone=clean_phone)
                         db.add(new_vip)
                         added_count += 1
+                else:
+                    missed_phone_count += 1
                         
         db.commit()
-        return {"message": f"同步完成！共找到並新增了 {added_count} 位 VIP 客戶。"}
+        msg = f"同步完成！自動新增了 {added_count} 位 VIP。"
+        if missed_phone_count > 0:
+            msg += f"\n(備註：有 {missed_phone_count} 筆行程雖然有 V，但在日曆上找不到 09 開頭的電話號碼，系統無法自動加入，需請您手動新增喔！)"
+            
+        return {"message": msg}
         
     except Exception as e:
         print(f"同步失敗: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
