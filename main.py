@@ -132,7 +132,6 @@ class BookingDB(Base):
     start_time = Column(DateTime)
     end_time = Column(DateTime)
 
-# ★ 稍微調整資料庫：允許 user_phone 為空，以便先建立沒有電話的 VIP
 class VipDB(Base):
     __tablename__ = "vips"
     id = Column(Integer, primary_key=True, index=True)
@@ -146,7 +145,6 @@ def upgrade_db_schema():
     try:
         db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_type VARCHAR;"))
         db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS remittance_last_5 VARCHAR;"))
-        # 若之前設定為 unique，這裡為了容錯不再強制檢查 (有需要可手動在 DB 端移除 unique index)
         db.commit()
     except Exception as e:
         db.rollback()
@@ -168,9 +166,9 @@ class BookingCreate(BaseModel):
 
 class VipCreate(BaseModel):
     user_name: str
-    user_phone: Optional[str] = None # ★ 修改：老闆手動新增時，電話變成選填
+    user_phone: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 自動補完電話版")
+app = FastAPI(title="單人美甲工作室 - 自動補完電話版 (去重複強化)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -187,20 +185,19 @@ def get_db():
     finally:
         db.close()
 
-# ★ 名字清理魔法：去掉括號與後續文字
 def clean_vip_name(raw_name: str) -> str:
-    # 例如把 "王小明 (手部) 末5" 切割成 "王小明"
-    return raw_name.split("(")[0].strip()
+    # 移除括號和後面的字 (如果有)
+    name = raw_name.split("(")[0].strip()
+    # 萬一有人用空白分隔，例如 "王小明 手部"，我們也可以嘗試切掉空白後面的字
+    # (但這比較危險，怕有人名字裡真的有空白，所以先保留只切括號的邏輯，這是最穩的)
+    return name
 
-# ★ 升級版的 VIP 檢查大腦
 def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
     cleaned_input_name = clean_vip_name(user_name)
     
-    # 1. 優先用「電話」查資料庫
     if user_phone:
         existing_vip_by_phone = db.query(VipDB).filter(VipDB.user_phone == user_phone).first()
         if existing_vip_by_phone:
-            # 如果發現名字有括號，順便清理一下
             clean_db_name = clean_vip_name(existing_vip_by_phone.user_name)
             if existing_vip_by_phone.user_name != clean_db_name:
                 existing_vip_by_phone.user_name = clean_db_name
@@ -211,22 +208,18 @@ def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
                 db.commit()
             return True
             
-    # 2. 如果電話查不到，試著用「乾淨的名字」查 (為了那些當初只有建名字沒有電話的 VIP)
     if cleaned_input_name != "VIP客戶":
         all_vips = db.query(VipDB).all()
         for vip in all_vips:
             if clean_vip_name(vip.user_name) == cleaned_input_name:
-                # 找到了！且他沒有留電話？太好了，趁現在幫他補上！
                 if not vip.user_phone and user_phone:
                     vip.user_phone = user_phone
                     db.commit()
                     print(f"已自動幫 VIP {cleaned_input_name} 補上電話：{user_phone}")
                 return True
                 
-    # 3. 如果資料庫真的沒有，再去翻 Google 日曆找 V
     if not calendar_service or not CALENDAR_ID: return False
     try:
-        # 先用電話搜
         events_result = calendar_service.events().list(
             calendarId=CALENDAR_ID, q=user_phone, maxResults=30, singleEvents=True
         ).execute()
@@ -239,7 +232,6 @@ def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
                 db.commit()
                 return True
                 
-        # 電話搜不到？再用名字去日曆搜搜看
         if cleaned_input_name != "VIP客戶":
             events_result_name = calendar_service.events().list(
                 calendarId=CALENDAR_ID, q=cleaned_input_name, maxResults=30, singleEvents=True
@@ -248,7 +240,6 @@ def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
             for event in events_name:
                 summary = event.get('summary', '').strip()
                 if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
-                    # 找到了！存入乾淨的名字和剛拿到的電話
                     new_vip = VipDB(user_name=cleaned_input_name, user_phone=user_phone)
                     db.add(new_vip)
                     db.commit()
@@ -281,7 +272,6 @@ def get_event_status(summary, start_time):
 def read_root():
     return {"message": "系統運行中：名字過濾與無電話補完機制上線！"}
 
-# ★ 前端解鎖檢查時，現在會傳名字進來比對了
 @app.get("/check-vip/{phone}")
 def api_check_vip(phone: str, name: str = "VIP客戶", db: Session = Depends(get_db)):
     is_vip = check_is_vip(phone.strip(), name.strip(), db)
@@ -292,15 +282,20 @@ def get_vips(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
         raise HTTPException(status_code=401, detail="密碼錯誤")
     
-    # 回傳給老闆前，再一次確保名字乾淨
     vips = db.query(VipDB).all()
     result = []
+    # 建立一個 set 來追蹤回傳的名字，避免顯示重複
+    seen_names = set() 
+    
     for v in vips:
         clean_name = clean_vip_name(v.user_name)
-        result.append({
-            "user_name": clean_name,
-            "user_phone": v.user_phone if v.user_phone else "尚未提供電話"
-        })
+        # 如果名字沒看過，才加進回傳清單
+        if clean_name not in seen_names:
+            seen_names.add(clean_name)
+            result.append({
+                "user_name": clean_name,
+                "user_phone": v.user_phone if v.user_phone else "尚未提供電話"
+            })
     return result
 
 @app.post("/api/vips")
@@ -311,13 +306,25 @@ def add_vip(vip: VipCreate, pwd: str, db: Session = Depends(get_db)):
     clean_name = clean_vip_name(vip.user_name)
     clean_phone = None
     
+    # 1. 檢查名字是否已經存在
+    existing_by_name = db.query(VipDB).all()
+    for v in existing_by_name:
+        if clean_vip_name(v.user_name) == clean_name:
+            # 如果想加入電話，且舊的沒電話，順便補上
+            if vip.user_phone and not v.user_phone:
+                clean_phone = re.sub(r'\D', '', vip.user_phone)
+                v.user_phone = clean_phone
+                db.commit()
+                return {"message": f"此 VIP ({clean_name}) 已存在，已為其補上電話！"}
+            raise HTTPException(status_code=400, detail="此 VIP 名字已經存在名單中囉！")
+
+    # 2. 檢查電話是否已經存在
     if vip.user_phone:
         clean_phone = re.sub(r'\D', '', vip.user_phone)
         exist = db.query(VipDB).filter(VipDB.user_phone == clean_phone).first()
         if exist:
             raise HTTPException(status_code=400, detail="此電話已經在 VIP 名單囉！")
             
-    # ★ 即使沒有電話，只要有名字一樣可以新增入庫
     new_vip = VipDB(user_name=clean_name, user_phone=clean_phone)
     db.add(new_vip)
     db.commit()
@@ -328,7 +335,6 @@ def delete_vip(name: str, pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
         raise HTTPException(status_code=401, detail="密碼錯誤")
         
-    # 因為電話可能為空，所以我們改用「乾淨名字」來刪除
     target_name = clean_vip_name(name)
     all_vips = db.query(VipDB).all()
     deleted = False
@@ -344,6 +350,7 @@ def delete_vip(name: str, pwd: str, db: Session = Depends(get_db)):
     db.commit()
     return {"message": "已移除 VIP 資格"}
 
+# ★ 強化的自動同步去重邏輯
 @app.post("/api/sync-vips")
 def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD:
@@ -364,6 +371,11 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
         added_count = 0
         missed_phone_count = 0
         
+        # 為了加速比對，先從 DB 抓出目前所有的乾淨名字和電話
+        all_db_vips = db.query(VipDB).all()
+        existing_names = {clean_vip_name(v.user_name) for v in all_db_vips}
+        existing_phones = {v.user_phone for v in all_db_vips if v.user_phone}
+        
         for event in events:
             summary = event.get('summary', '').strip()
             desc = event.get('description', '')
@@ -375,31 +387,46 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
                 raw_name = name_match.group(1).strip() if name_match else "VIP客戶"
                 clean_name = clean_vip_name(raw_name)
                 
+                if clean_name == "VIP客戶" or clean_name == "": continue # 跳過無效名稱
+                
                 combined_text = summary + " " + desc
                 phone_match = re.search(r'09\d{2}[-\s]?\d{3}[-\s]?\d{3}', combined_text)
                 
+                clean_phone = None
                 if phone_match:
                     raw_phone = phone_match.group(0)
                     clean_phone = re.sub(r'\D', '', raw_phone) 
+                
+                # ★ 去重複邏輯判斷
+                # 如果名字已經在名單裡
+                if clean_name in existing_names:
+                    # 順便檢查：如果名單裡那筆沒電話，但這次掃描有抓到電話，就幫他補上去！
+                    if clean_phone and clean_phone not in existing_phones:
+                        target_vip = db.query(VipDB).filter(VipDB.user_name.like(f"{clean_name}%")).first()
+                        if target_vip and not target_vip.user_phone:
+                            target_vip.user_phone = clean_phone
+                            existing_phones.add(clean_phone)
+                    continue # 名字已經存在，跳過新增動作
                     
-                    exist = db.query(VipDB).filter(VipDB.user_phone == clean_phone).first()
-                    if not exist:
-                        new_vip = VipDB(user_name=clean_name, user_phone=clean_phone)
-                        db.add(new_vip)
-                        added_count += 1
-                else:
-                    # ★ 就算沒電話，名字乾淨，也先幫他建檔！
-                    all_vips = db.query(VipDB).all()
-                    already_exist = any(clean_vip_name(v.user_name) == clean_name for v in all_vips)
-                    if not already_exist and clean_name != "VIP客戶":
-                         new_vip = VipDB(user_name=clean_name, user_phone=None)
-                         db.add(new_vip)
-                         added_count += 1
-                    else:
-                        missed_phone_count += 1
+                # 如果這支電話已經在名單裡 (可能是同一個客人但換名字預約)
+                if clean_phone and clean_phone in existing_phones:
+                    continue # 電話已經存在，跳過新增動作
+                
+                # 通過檢查！是一個全新未見過的 VIP，進行新增
+                new_vip = VipDB(user_name=clean_name, user_phone=clean_phone)
+                db.add(new_vip)
+                db.commit() # 新增後馬上 commit
+                
+                # 更新我們用來檢查的 Set，防止同一次掃描裡重複新增
+                existing_names.add(clean_name)
+                if clean_phone:
+                    existing_phones.add(clean_phone)
+                    
+                added_count += 1
+                if not clean_phone:
+                     missed_phone_count += 1
                         
-        db.commit()
-        msg = f"同步完成！自動清理並新增了 {added_count} 位 VIP。"
+        msg = f"同步完成！自動清理並新增了 {added_count} 位全新 VIP。"
         return {"message": msg}
         
     except Exception as e:
