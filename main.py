@@ -145,9 +145,12 @@ def upgrade_db_schema():
     try:
         db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_type VARCHAR;"))
         db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS remittance_last_5 VARCHAR;"))
+        # ★ 新增這行：強制移除 PostgreSQL 對 vips 表格中 user_phone 的唯一限制
+        db.execute(text("ALTER TABLE vips DROP CONSTRAINT IF EXISTS ix_vips_user_phone;"))
         db.commit()
     except Exception as e:
         db.rollback()
+        print(f"資料庫更新警告 (可忽略): {e}") # 加上印出錯誤，方便除錯
         pass
     finally:
         db.close()
