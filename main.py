@@ -136,26 +136,33 @@ class VipDB(Base):
     __tablename__ = "vips"
     id = Column(Integer, primary_key=True, index=True)
     user_name = Column(String)
-    # ★ 修復點 1：拿掉 unique=True
-    user_phone = Column(String, index=True) 
+    user_phone = Column(String) # 完全拿掉 unique 和 index
 
 Base.metadata.create_all(bind=engine)
 
+# ★ 強制拆分獨立執行的資料庫清理程序
 def upgrade_db_schema():
     db = SessionLocal()
-    try:
-        db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_type VARCHAR;"))
-        db.execute(text("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS remittance_last_5 VARCHAR;"))
-        # ★ 修復點 2：強制解除資料庫端的 unique 限制 (若為 PostgreSQL)
-        db.execute(text("ALTER TABLE vips DROP CONSTRAINT IF EXISTS vips_user_phone_key;"))
-        db.execute(text("ALTER TABLE vips DROP CONSTRAINT IF EXISTS ix_vips_user_phone;"))
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        print(f"資料庫綱要更新警告 (通常可忽略): {e}")
-        pass
-    finally:
-        db.close()
+    
+    # 我們把所有可能失敗的 SQL 拆開來，一條一條執行
+    queries = [
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS service_type VARCHAR;",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS remittance_last_5 VARCHAR;",
+        "ALTER TABLE vips DROP CONSTRAINT IF EXISTS vips_user_phone_key;",  # 砍掉 constraint
+        "DROP INDEX IF EXISTS ix_vips_user_phone;"                          # 砍掉 index
+    ]
+    
+    for q in queries:
+        try:
+            db.execute(text(q))
+            db.commit()
+            print(f"成功執行: {q}")
+        except Exception as e:
+            db.rollback()
+            print(f"執行跳過 (無須擔心): {q} -> {e}")
+            
+    db.close()
+
 upgrade_db_schema()
 
 DEFAULT_DURATION = 120 
@@ -173,7 +180,7 @@ class VipCreate(BaseModel):
     user_name: str
     user_phone: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 修復連線版")
+app = FastAPI(title="單人美甲工作室 - 強制解鎖資料庫版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -328,8 +335,9 @@ def add_vip(vip: VipCreate, pwd: str, db: Session = Depends(get_db)):
         return {"message": "新增 VIP 成功！若未填電話，系統將於客人下次預約時自動補上。"}
     except Exception as e:
         print(f"新增 VIP 時發生錯誤: {e}")
-        db.rollback() # 發生錯誤時退回
-        raise HTTPException(status_code=500, detail="伺服器內部錯誤，請檢查資料庫")
+        db.rollback() 
+        # ★ 如果失敗，直接把真實錯誤噴在畫面上給老闆看
+        raise HTTPException(status_code=500, detail=f"資料庫拒絕寫入，真實原因：{str(e)}")
 
 @app.delete("/api/vips/{name}")
 def delete_vip(name: str, pwd: str, db: Session = Depends(get_db)):
