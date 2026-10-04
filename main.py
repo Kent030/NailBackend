@@ -1,14 +1,13 @@
-import os 
-import json 
+import os
+import json
 import re
-import calendar 
-import asyncio 
-import pytz # ★ 新增這個
-from google.oauth2 import service_account 
-# ... (其他 import 維持不變)
-from googleapiclient.discovery import build 
+import calendar
+import asyncio
+import pytz
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
-from typing import Optional 
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
@@ -33,26 +32,22 @@ if google_creds_str:
     except Exception as e:
         print(f"Google Calendar 授權失敗: {e}")
 
-# ★ 升級：把抓取上限提高到 2000 筆，確保未來幾個月的行程都不會被漏掉
 def get_google_calendar_events(max_results=2500):
     if not calendar_service or not CALENDAR_ID:
         return []
     try:
         today = datetime.now()
-        # 起始時間：這個月 1 號
         first_day = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-        time_min_str = first_day.isoformat() + 'Z' 
+        time_min_str = first_day.isoformat() + 'Z'
         
-        # ★ 終極修復：加上「煞車時間 (timeMax)」！只往後抓 90 天 (3個月)
-        # 防止「永遠重複的行程」把 2500 筆的扣打全部塞滿！
         end_day = first_day + timedelta(days=90)
         time_max_str = end_day.isoformat() + 'Z'
 
         events_result = calendar_service.events().list(
-            calendarId=CALENDAR_ID, 
+            calendarId=CALENDAR_ID,
             timeMin=time_min_str,
-            timeMax=time_max_str,      # ★ 告訴 Google 到這裡就停！
-            maxResults=max_results, 
+            timeMax=time_max_str,
+            maxResults=max_results,
             singleEvents=True,
             orderBy='startTime'
         ).execute()
@@ -80,7 +75,7 @@ def get_google_calendar_events(max_results=2500):
                 "start_time": start_dt,
                 "end_time": end_dt,
                 "is_full_day": is_full_day,
-                "description": event.get('description', '') 
+                "description": event.get('description', '')
             })
         return parsed_events
     except Exception as e:
@@ -92,8 +87,8 @@ def update_google_calendar_event(event_id: str, new_summary: str, end_time: date
         return
     try:
         event_obj = calendar_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
-        event_obj['summary'] = new_summary 
-        event_obj['description'] = description  
+        event_obj['summary'] = new_summary
+        event_obj['description'] = description
         
         if 'dateTime' in event_obj['end']:
             event_obj['end']['dateTime'] = end_time.strftime("%Y-%m-%dT%H:%M:%S+08:00")
@@ -113,8 +108,8 @@ def revert_google_calendar_event(start_time: datetime):
                 event_obj = calendar_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
                 
                 time_str = start_time.strftime("%H:%M")
-                event_obj['summary'] = time_str 
-                event_obj['description'] = "" 
+                event_obj['summary'] = time_str
+                event_obj['description'] = ""
                 
                 default_end = start_time + timedelta(hours=1)
                 if 'dateTime' in event_obj['end']:
@@ -137,19 +132,19 @@ class BookingDB(Base):
     id = Column(Integer, primary_key=True, index=True)
     user_name = Column(String, index=True)
     user_phone = Column(String)
-    service_name = Column(String, default="美甲預約") 
-    service_type = Column(String, nullable=True)     
-    remittance_last_5 = Column(String, nullable=True) 
+    service_name = Column(String, default="美甲預約")
+    service_type = Column(String, nullable=True)
+    remittance_last_5 = Column(String, nullable=True)
     start_time = Column(DateTime)
     end_time = Column(DateTime)
-    created_at = Column(DateTime, default=datetime.now) 
+    created_at = Column(DateTime, default=datetime.now)
     payment_status = Column(String, default="待匯款")
 
 class VipDB(Base):
     __tablename__ = "vips"
     id = Column(Integer, primary_key=True, index=True)
     user_name = Column(String)
-    user_phone = Column(String) 
+    user_phone = Column(String)
 
 Base.metadata.create_all(bind=engine)
 
@@ -161,7 +156,7 @@ def upgrade_db_schema():
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_status VARCHAR DEFAULT '待匯款';",
         "ALTER TABLE vips DROP CONSTRAINT IF EXISTS vips_user_phone_key;",
-        "DROP INDEX IF EXISTS ix_vips_user_phone;"                          
+        "DROP INDEX IF EXISTS ix_vips_user_phone;"
     ]
     for q in queries:
         try:
@@ -173,9 +168,9 @@ def upgrade_db_schema():
 
 upgrade_db_schema()
 
-DEFAULT_DURATION = 120 
-BUFFER_TIME = 15 
-BOSS_PWD = "8888" 
+DEFAULT_DURATION = 120
+BUFFER_TIME = 15
+BOSS_PWD = "8888"
 
 class BookingCreate(BaseModel):
     user_name: str
@@ -186,13 +181,13 @@ class BookingCreate(BaseModel):
 
 class VipCreate(BaseModel):
     user_name: str
-    user_phone: Optional[str] = None 
+    user_phone: Optional[str] = None
 
-app = FastAPI(title="單人美甲工作室 - 超強辨識與防漏版")
+app = FastAPI(title="單人美甲工作室 - 時區完美校正版")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -258,27 +253,17 @@ def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
     except Exception as e:
         return False
 
-# ★ 升級大腦：讓系統看懂老闆開放預約的字
 def get_event_status(summary, start_time):
     summary = summary.strip()
-    
-    # 1. 沒打標題：一律視為私人休息
-    if not summary: 
+    if not summary:
         return "PRIVATE"
-        
-    # 2. 明確寫了休息關鍵字：視為私人休息
-    if any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留", "不開放"]): 
+    if any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留", "不開放"]):
         return "PRIVATE"
-        
-    # 3. 開放預約判斷：純數字時間(14:00) 或是 標題有"可預約"、"開放"等字
     summary_lower = summary.lower()
-    if re.fullmatch(r'^[0-9:：.\s]+$', summary) or any(k in summary_lower for k in ["可預約", "開放", "空檔", "open"]): 
+    if re.fullmatch(r'^[0-9:：.\s]+$', summary) or any(k in summary_lower for k in ["可預約", "開放", "空檔", "open"]):
         return "OPEN"
-        
-    # 4. 其他有打中文/英文字的情況：視為已被客人預約
-    if not bool(re.search(r'[a-zA-Z0-9\u4e00-\u9fa5]', summary)): 
+    if not bool(re.search(r'[a-zA-Z0-9\u4e00-\u9fa5]', summary)):
         return "PRIVATE"
-        
     return "BOOKED"
 
 async def auto_cancel_unpaid_bookings():
@@ -306,7 +291,7 @@ async def startup_event():
     asyncio.create_task(auto_cancel_unpaid_bookings())
 
 @app.get("/")
-@app.head("/") 
+@app.head("/")
 def read_root():
     return {"message": "系統運行中：超強辨識與自動取消機器人已上線！"}
 
@@ -320,7 +305,7 @@ def get_vips(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD: raise HTTPException(status_code=401)
     vips = db.query(VipDB).all()
     result = []
-    seen_names = set() 
+    seen_names = set()
     for v in vips:
         clean_name = clean_vip_name(v.user_name)
         if clean_name not in seen_names:
@@ -352,7 +337,7 @@ def add_vip(vip: VipCreate, pwd: str, db: Session = Depends(get_db)):
         db.commit()
         return {"message": "新增 VIP 成功！"}
     except Exception as e:
-        db.rollback() 
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"內部錯誤：{str(e)}")
 
 @app.delete("/api/vips/{name}")
@@ -386,7 +371,7 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
             if re.search(r'(^|\s|\d)[vV]([\s\d\u4e00-\u9fa5]|$)', summary):
                 name_match = re.search(r'[vV]\s*([^\d\(\)\-\s]+)', summary)
                 clean_name = clean_vip_name(name_match.group(1).strip() if name_match else "VIP客戶")
-                if clean_name == "VIP客戶" or clean_name == "": continue 
+                if clean_name == "VIP客戶" or clean_name == "": continue
                 phone_match = re.search(r'09\d{2}[-\s]?\d{3}[-\s]?\d{3}', summary + " " + desc)
                 clean_phone = re.sub(r'\D', '', phone_match.group(0)) if phone_match else None
                 if clean_name in existing_names:
@@ -395,10 +380,10 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
                         if target_vip and not target_vip.user_phone:
                             target_vip.user_phone = clean_phone
                             existing_phones.add(clean_phone)
-                    continue 
-                if clean_phone and clean_phone in existing_phones: continue 
+                    continue
+                if clean_phone and clean_phone in existing_phones: continue
                 db.add(VipDB(user_name=clean_name, user_phone=clean_phone))
-                db.commit() 
+                db.commit()
                 existing_names.add(clean_name)
                 if clean_phone: existing_phones.add(clean_phone)
                 added_count += 1
@@ -439,12 +424,16 @@ def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
     if any(ge for ge in google_events if ge['start_time'].date() == target_date and ge['is_full_day']):
         return {"date": date_str, "slots": []}
     schedule_result = []
+    
+    tz_taipei = pytz.timezone('Asia/Taipei')
+    now_taipei = datetime.now(tz_taipei).replace(tzinfo=None)
+
     for ge in google_events:
         if ge['start_time'].date() == target_date and not ge['is_full_day']:
-            time_str = ge['start_time'].strftime("%H:%M") 
+            time_str = ge['start_time'].strftime("%H:%M")
             status = get_event_status(ge['summary'], ge['start_time'])
             if status == "OPEN":
-                if ge['start_time'] >= datetime.now():
+                if ge['start_time'] >= now_taipei:
                     schedule_result.append({"time": time_str, "status": "可預約", "reason": ""})
             elif status == "BOOKED":
                 schedule_result.append({"time": time_str, "status": "不可預約", "reason": "已被預約"})
@@ -463,7 +452,7 @@ def get_all_bookings(db: Session = Depends(get_db)):
         if gcal_info and gcal_info["status"] == "BOOKED":
             db_start_times.append(b.start_time)
             result.append({"id": b.id, "user_name": b.user_name, "user_phone": b.user_phone, "service_name": b.service_name, "service_type": b.service_type, "remittance_last_5": b.remittance_last_5, "start_time": b.start_time, "end_time": b.end_time})
-    fake_id = -1 
+    fake_id = -1
     for ge in google_events:
         if ge['start_time'] in db_start_times: continue
         status = gcal_status_map[ge['start_time']]["status"]
@@ -497,7 +486,7 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
 
     new_booking = BookingDB(
         user_name=booking.user_name, user_phone=user_phone, service_name="美甲預約",
-        service_type=booking.service_type, remittance_last_5=booking.remittance_last_5, 
+        service_type=booking.service_type, remittance_last_5=booking.remittance_last_5,
         start_time=booking_start_time, end_time=calculated_end_time,
         created_at=datetime.now(), payment_status=initial_payment_status
     )
