@@ -2,7 +2,7 @@ import os
 import json 
 import re
 import calendar 
-import asyncio # ★ 新增：用於背景自動執行清理任務
+import asyncio 
 from google.oauth2 import service_account 
 from googleapiclient.discovery import build 
 
@@ -31,7 +31,8 @@ if google_creds_str:
     except Exception as e:
         print(f"Google Calendar 授權失敗: {e}")
 
-def get_google_calendar_events(max_results=500):
+# ★ 升級：把抓取上限提高到 2000 筆，確保未來幾個月的行程都不會被漏掉
+def get_google_calendar_events(max_results=2000):
     if not calendar_service or not CALENDAR_ID:
         return []
     try:
@@ -117,7 +118,7 @@ def revert_google_calendar_event(start_time: datetime):
 # ==========================================
 # 1. 資料庫設定
 # ==========================================
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres.sugdvdzopuvoronneugd:Lun09260616!@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres"
+SQLALCHEMY_DATABASE_URL = "postgresql+psycopg2://postgres.sugdvdzopuvoronneugd:Lun09260616!@aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres"
 engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -132,7 +133,6 @@ class BookingDB(Base):
     remittance_last_5 = Column(String, nullable=True) 
     start_time = Column(DateTime)
     end_time = Column(DateTime)
-    # ★ 新增：對帳用欄位
     created_at = Column(DateTime, default=datetime.now) 
     payment_status = Column(String, default="待匯款")
 
@@ -179,7 +179,7 @@ class VipCreate(BaseModel):
     user_name: str
     user_phone: Optional[str] = None 
 
-app = FastAPI(title="單人美甲工作室 - 自動對帳解鎖版")
+app = FastAPI(title="單人美甲工作室 - 超強辨識與防漏版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -249,59 +249,57 @@ def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
     except Exception as e:
         return False
 
+# ★ 升級大腦：讓系統看懂老闆開放預約的字
 def get_event_status(summary, start_time):
     summary = summary.strip()
-    if not summary: return "PRIVATE"
-    if any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留"]): return "PRIVATE"
-    if re.fullmatch(r'^[0-9:：.\s]+$', summary): return "OPEN"
-    if not bool(re.search(r'[a-zA-Z0-9\u4e00-\u9fa5]', summary)): return "PRIVATE"
+    
+    # 1. 沒打標題：一律視為私人休息
+    if not summary: 
+        return "PRIVATE"
+        
+    # 2. 明確寫了休息關鍵字：視為私人休息
+    if any(k in summary for k in ["休息", "休假", "外出", "私人", "店休", "吃飯", "保留", "不開放"]): 
+        return "PRIVATE"
+        
+    # 3. 開放預約判斷：純數字時間(14:00) 或是 標題有"可預約"、"開放"等字
+    summary_lower = summary.lower()
+    if re.fullmatch(r'^[0-9:：.\s]+$', summary) or any(k in summary_lower for k in ["可預約", "開放", "空檔", "open"]): 
+        return "OPEN"
+        
+    # 4. 其他有打中文/英文字的情況：視為已被客人預約
+    if not bool(re.search(r'[a-zA-Z0-9\u4e00-\u9fa5]', summary)): 
+        return "PRIVATE"
+        
     return "BOOKED"
 
-# ==========================================
-# ★ 自動取消機器人 (背景運行)
-# ==========================================
 async def auto_cancel_unpaid_bookings():
     while True:
         try:
             db = SessionLocal()
-            # 設定逾期標準：超過 72 小時 (三天)
             three_days_ago = datetime.now() - timedelta(days=3)
-            
-            # 尋找「狀態是待匯款」、「建立時間大於三天」、「且預約時間還沒到」的單子
             expired_bookings = db.query(BookingDB).filter(
                 BookingDB.payment_status == "待匯款",
                 BookingDB.created_at <= three_days_ago,
                 BookingDB.start_time > datetime.now()
             ).all()
-            
             for b in expired_bookings:
                 target_start = b.start_time
-                print(f"[自動取消] 逾期未匯款: {b.user_name} (預約時段: {target_start})")
                 db.delete(b)
                 db.commit()
-                # 恢復 Google 行事曆為可預約
                 revert_google_calendar_event(target_start)
-                
             db.close()
         except Exception as e:
             print(f"自動巡邏發生錯誤: {e}")
-        
-        # 每隔 1 小時醒來巡邏一次
         await asyncio.sleep(3600)
 
 @app.on_event("startup")
 async def startup_event():
-    # 伺服器啟動時，派遺自動取消機器人去背景工作
     asyncio.create_task(auto_cancel_unpaid_bookings())
 
-
-# ==========================================
-# 4. API 路由 (Endpoints)
-# ==========================================
 @app.get("/")
 @app.head("/") 
 def read_root():
-    return {"message": "系統運行中：自動取消機器人已上線！"}
+    return {"message": "系統運行中：超強辨識與自動取消機器人已上線！"}
 
 @app.get("/check-vip/{phone}")
 def api_check_vip(phone: str, name: str = "VIP客戶", db: Session = Depends(get_db)):
@@ -400,26 +398,18 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-# ==========================================
-# ★ 老闆專用對帳 API
-# ==========================================
 @app.get("/api/admin/bookings")
 def get_admin_bookings(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD: raise HTTPException(status_code=401)
-    # 只抓取未來的預約
     bookings = db.query(BookingDB).filter(BookingDB.start_time > datetime.now()).order_by(BookingDB.start_time).all()
     res = []
     for b in bookings:
         res.append({
-            "id": b.id,
-            "user_name": b.user_name,
-            "user_phone": b.user_phone,
-            "service_type": b.service_type,
-            "remittance_last_5": b.remittance_last_5,
+            "id": b.id, "user_name": b.user_name, "user_phone": b.user_phone,
+            "service_type": b.service_type, "remittance_last_5": b.remittance_last_5,
             "start_time_display": b.start_time.strftime("%m/%d %H:%M"),
             "created_at_display": b.created_at.strftime("%m/%d %H:%M"),
-            "created_at": b.created_at.isoformat(),
-            "payment_status": b.payment_status
+            "created_at": b.created_at.isoformat(), "payment_status": b.payment_status
         })
     return res
 
@@ -432,11 +422,9 @@ def update_booking_status(booking_id: int, status: str, pwd: str, db: Session = 
     db.commit()
     return {"message": "狀態更新成功"}
 
-
 @app.get("/daily-schedule")
 def get_daily_schedule(date_str: str, db: Session = Depends(get_db)):
-    try:
-        target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    try: target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
     except ValueError: raise HTTPException(status_code=400)
     google_events = get_google_calendar_events()
     if any(ge for ge in google_events if ge['start_time'].date() == target_date and ge['is_full_day']):
@@ -496,20 +484,13 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="這個時段尚未開放，或剛剛被預約走囉！")
     
     calculated_end_time = booking_start_time + timedelta(minutes=(DEFAULT_DURATION + BUFFER_TIME))
-    
-    # ★ 聰明判斷：如果有輸入連續3個以上的數字，代表他填了帳號，標記為「待對帳」；反之「待匯款」
     initial_payment_status = "待對帳" if re.search(r'\d{3,}', booking.remittance_last_5) else "待匯款"
 
     new_booking = BookingDB(
-        user_name=booking.user_name,
-        user_phone=user_phone,
-        service_name="美甲預約",
-        service_type=booking.service_type,           
-        remittance_last_5=booking.remittance_last_5, 
-        start_time=booking_start_time,
-        end_time=calculated_end_time,
-        created_at=datetime.now(),
-        payment_status=initial_payment_status
+        user_name=booking.user_name, user_phone=user_phone, service_name="美甲預約",
+        service_type=booking.service_type, remittance_last_5=booking.remittance_last_5, 
+        start_time=booking_start_time, end_time=calculated_end_time,
+        created_at=datetime.now(), payment_status=initial_payment_status
     )
     db.add(new_booking)
     db.commit()
@@ -517,13 +498,7 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
 
     vip_prefix = "V " if is_vip else ""
     new_summary = f"{vip_prefix}{time_str} {booking.user_name} ({booking.service_type}) 末5:{booking.remittance_last_5}"
-    new_description = (
-        f"📱 聯絡電話：{user_phone}\n"
-        f"💅 預約部位：{booking.service_type}\n"
-        f"💰 匯款末五碼：{booking.remittance_last_5}\n"
-        f"👑 VIP 客戶：{'是' if is_vip else '否'}\n"
-        f"⏳ 系統自動保留時間：{DEFAULT_DURATION} 分鐘"
-    )
+    new_description = f"📱 聯絡電話：{user_phone}\n💅 預約部位：{booking.service_type}\n💰 匯款末五碼：{booking.remittance_last_5}\n👑 VIP 客戶：{'是' if is_vip else '否'}\n⏳ 系統自動保留時間：{DEFAULT_DURATION} 分鐘"
     update_google_calendar_event(target_event_id, new_summary, calculated_end_time, new_description)
     return {"message": "預約成功！", "booking_id": new_booking.id}
 
