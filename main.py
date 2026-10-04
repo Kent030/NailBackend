@@ -32,17 +32,24 @@ if google_creds_str:
         print(f"Google Calendar 授權失敗: {e}")
 
 # ★ 升級：把抓取上限提高到 2000 筆，確保未來幾個月的行程都不會被漏掉
-def get_google_calendar_events(max_results=2000):
+def get_google_calendar_events(max_results=2500):
     if not calendar_service or not CALENDAR_ID:
         return []
     try:
         today = datetime.now()
+        # 起始時間：這個月 1 號
         first_day = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         time_min_str = first_day.isoformat() + 'Z' 
         
+        # ★ 終極修復：加上「煞車時間 (timeMax)」！只往後抓 90 天 (3個月)
+        # 防止「永遠重複的行程」把 2500 筆的扣打全部塞滿！
+        end_day = first_day + timedelta(days=90)
+        time_max_str = end_day.isoformat() + 'Z'
+
         events_result = calendar_service.events().list(
             calendarId=CALENDAR_ID, 
             timeMin=time_min_str,
+            timeMax=time_max_str,      # ★ 告訴 Google 到這裡就停！
             maxResults=max_results, 
             singleEvents=True,
             orderBy='startTime'
