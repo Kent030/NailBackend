@@ -9,7 +9,7 @@ from googleapiclient.discovery import build
 
 from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from pydantic import BaseModel
 from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, text
@@ -146,6 +146,26 @@ class VipDB(Base):
     user_name = Column(String)
     user_phone = Column(String)
 
+# ★ 新增：操作日誌資料表
+class ActionLogDB(Base):
+    __tablename__ = "action_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    action_type = Column(String) # 例如: "預約", "取消", "系統取消"
+    user_name = Column(String)
+    user_phone = Column(String)
+    target_time = Column(DateTime) # 預約的時段
+    action_time = Column(DateTime, default=datetime.now) # 動作發生的時間
+    details = Column(String, nullable=True)
+
+# ★ 新增：黑名單資料表
+class BlacklistDB(Base):
+    __tablename__ = "blacklist"
+    id = Column(Integer, primary_key=True, index=True)
+    user_phone = Column(String, unique=True, index=True)
+    user_name = Column(String, nullable=True)
+    reason = Column(String, nullable=True)
+    added_at = Column(DateTime, default=datetime.now)
+
 Base.metadata.create_all(bind=engine)
 
 def upgrade_db_schema():
@@ -183,7 +203,12 @@ class VipCreate(BaseModel):
     user_name: str
     user_phone: Optional[str] = None
 
-app = FastAPI(title="單人美甲工作室 - 時區完美校正版")
+class BlacklistCreate(BaseModel):
+    user_phone: str
+    user_name: Optional[str] = None
+    reason: Optional[str] = None
+
+app = FastAPI(title="單人美甲工作室 - 營運管理加強版 (含日誌與黑名單)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -200,8 +225,30 @@ def get_db():
     finally:
         db.close()
 
+# --- 共用函式 ---
 def clean_vip_name(raw_name: str) -> str:
     return raw_name.split("(")[0].strip()
+
+def is_blacklisted(user_phone: str, db: Session) -> bool:
+    clean_phone = re.sub(r'\D', '', user_phone)
+    if not clean_phone: return False
+    return db.query(BlacklistDB).filter(BlacklistDB.user_phone == clean_phone).first() is not None
+
+def log_action(db: Session, action_type: str, name: str, phone: str, target_time: datetime, details: str = ""):
+    try:
+        new_log = ActionLogDB(
+            action_type=action_type,
+            user_name=name,
+            user_phone=phone,
+            target_time=target_time,
+            action_time=datetime.now(),
+            details=details
+        )
+        db.add(new_log)
+        db.commit()
+    except Exception as e:
+        print(f"寫入日誌失敗: {e}")
+        db.rollback()
 
 def check_is_vip(user_phone: str, user_name: str, db: Session) -> bool:
     cleaned_input_name = clean_vip_name(user_name)
@@ -278,6 +325,8 @@ async def auto_cancel_unpaid_bookings():
             ).all()
             for b in expired_bookings:
                 target_start = b.start_time
+                # ★ 記錄系統自動取消
+                log_action(db, "系統取消", b.user_name, b.user_phone, b.start_time, "超過72小時未匯款自動取消")
                 db.delete(b)
                 db.commit()
                 revert_google_calendar_event(target_start)
@@ -293,13 +342,16 @@ async def startup_event():
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"message": "系統運行中：超強辨識與自動取消機器人已上線！"}
+    return {"message": "系統運行中：日誌與黑名單系統已上線！"}
 
 @app.get("/check-vip/{phone}")
 def api_check_vip(phone: str, name: str = "VIP客戶", db: Session = Depends(get_db)):
     is_vip = check_is_vip(phone.strip(), name.strip(), db)
     return {"is_vip": is_vip}
 
+# ==========================================
+# ★ VIP 管理
+# ==========================================
 @app.get("/api/vips")
 def get_vips(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD: raise HTTPException(status_code=401)
@@ -392,6 +444,56 @@ def sync_vips_from_calendar(pwd: str, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+# ==========================================
+# ★ 黑名單與日誌管理
+# ==========================================
+@app.get("/api/admin/logs")
+def get_action_logs(pwd: str, limit: int = 50, db: Session = Depends(get_db)):
+    if pwd != BOSS_PWD: raise HTTPException(status_code=401)
+    logs = db.query(ActionLogDB).order_by(ActionLogDB.action_time.desc()).limit(limit).all()
+    res = []
+    for l in logs:
+        res.append({
+            "action_type": l.action_type,
+            "user_name": l.user_name,
+            "user_phone": l.user_phone,
+            "target_time": l.target_time.strftime("%m/%d %H:%M"),
+            "action_time": l.action_time.strftime("%m/%d %H:%M"),
+            "details": l.details
+        })
+    return res
+
+@app.get("/api/admin/blacklist")
+def get_blacklist(pwd: str, db: Session = Depends(get_db)):
+    if pwd != BOSS_PWD: raise HTTPException(status_code=401)
+    bl = db.query(BlacklistDB).order_by(BlacklistDB.added_at.desc()).all()
+    return [{"id": b.id, "user_phone": b.user_phone, "user_name": b.user_name, "reason": b.reason, "added_at": b.added_at.strftime("%Y/%m/%d")} for b in bl]
+
+@app.post("/api/admin/blacklist")
+def add_blacklist(item: BlacklistCreate, pwd: str, db: Session = Depends(get_db)):
+    if pwd != BOSS_PWD: raise HTTPException(status_code=401)
+    clean_phone = re.sub(r'\D', '', item.user_phone)
+    if not clean_phone: raise HTTPException(status_code=400, detail="電話格式錯誤")
+    if db.query(BlacklistDB).filter(BlacklistDB.user_phone == clean_phone).first():
+        raise HTTPException(status_code=400, detail="此電話已在黑名單中")
+    new_bl = BlacklistDB(user_phone=clean_phone, user_name=item.user_name, reason=item.reason)
+    db.add(new_bl)
+    db.commit()
+    return {"message": "已加入黑名單"}
+
+@app.delete("/api/admin/blacklist/{phone}")
+def remove_blacklist(phone: str, pwd: str, db: Session = Depends(get_db)):
+    if pwd != BOSS_PWD: raise HTTPException(status_code=401)
+    clean_phone = re.sub(r'\D', '', phone)
+    bl = db.query(BlacklistDB).filter(BlacklistDB.user_phone == clean_phone).first()
+    if not bl: raise HTTPException(status_code=404)
+    db.delete(bl)
+    db.commit()
+    return {"message": "已從黑名單移除"}
+
+# ==========================================
+# ★ 預約相關
+# ==========================================
 @app.get("/api/admin/bookings")
 def get_admin_bookings(pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD: raise HTTPException(status_code=401)
@@ -466,16 +568,26 @@ def get_all_bookings(db: Session = Depends(get_db)):
 
 @app.post("/bookings")
 def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
+    user_phone = booking.user_phone.strip()
+    
+    # ★ 黑名單檢查
+    if is_blacklisted(user_phone, db):
+        # 偷偷記錄嘗試預約
+        log_action(db, "拒絕預約", booking.user_name, user_phone, booking.start_time, "觸發黑名單攔截")
+        raise HTTPException(status_code=403, detail="很抱歉，系統暫時無法接受您的預約，如有疑問請聯絡老闆。")
+
     booking_start_time = booking.start_time.replace(tzinfo=None)
     time_str = booking_start_time.strftime("%H:%M")
-    user_phone = booking.user_phone.strip()
+    
     is_vip = check_is_vip(user_phone, booking.user_name, db)
     now = datetime.now()
     if now.month == 12: max_year, max_month = now.year + 1, 1
     else: max_year, max_month = now.year, now.month + 1
     max_allowed_date = datetime(max_year, max_month, calendar.monthrange(max_year, max_month)[1], 23, 59, 59)
+    
     if booking_start_time > max_allowed_date and not is_vip:
         raise HTTPException(status_code=400, detail=f"目前僅開放預約至 {max_month} 月底喔！後續月份將於日後陸續開放，敬請見諒。")
+        
     google_events = get_google_calendar_events()
     target_event_id = next((ge['id'] for ge in google_events if ge['start_time'] == booking_start_time and not ge['is_full_day'] and get_event_status(ge['summary'], ge['start_time']) == "OPEN"), None)
     if not target_event_id:
@@ -498,6 +610,10 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     new_summary = f"{vip_prefix}{time_str} {booking.user_name} ({booking.service_type}) 末5:{booking.remittance_last_5}"
     new_description = f"📱 聯絡電話：{user_phone}\n💅 預約部位：{booking.service_type}\n💰 匯款末五碼：{booking.remittance_last_5}\n👑 VIP 客戶：{'是' if is_vip else '否'}\n⏳ 系統自動保留時間：{DEFAULT_DURATION} 分鐘"
     update_google_calendar_event(target_event_id, new_summary, calculated_end_time, new_description)
+    
+    # ★ 記錄預約操作
+    log_action(db, "預約", booking.user_name, user_phone, booking_start_time, f"部位:{booking.service_type}, 末5碼:{booking.remittance_last_5}")
+    
     return {"message": "預約成功！", "booking_id": new_booking.id}
 
 @app.delete("/bookings/{booking_id}")
@@ -505,6 +621,10 @@ def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     booking_to_delete = db.query(BookingDB).filter(BookingDB.id == booking_id).first()
     if not booking_to_delete: raise HTTPException(status_code=404)
     target_start_time = booking_to_delete.start_time
+    
+    # ★ 記錄取消操作
+    log_action(db, "取消", booking_to_delete.user_name, booking_to_delete.user_phone, target_start_time, "客人手動取消預約")
+    
     db.delete(booking_to_delete)
     db.commit()
     revert_google_calendar_event(target_start_time)
