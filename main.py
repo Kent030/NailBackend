@@ -97,27 +97,50 @@ def update_google_calendar_event(event_id: str, new_summary: str, end_time: date
     except Exception as e:
         print(f"更新 Google 日曆失敗: {e}")
 
-def revert_google_calendar_event(start_time: datetime):
+# ★ 升級版：直接用 event_id 精準恢復事件，不再用時間模糊搜尋
+def revert_google_calendar_event_by_id(event_id: str, start_time: datetime):
+    if not calendar_service or not CALENDAR_ID:
+        return
+    try:
+        event_obj = calendar_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
+        
+        time_str = start_time.strftime("%H:%M")
+        event_obj['summary'] = time_str
+        event_obj['description'] = ""
+        
+        default_end = start_time + timedelta(hours=1)
+        if 'dateTime' in event_obj['end']:
+            event_obj['end']['dateTime'] = default_end.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+            event_obj['end']['timeZone'] = 'Asia/Taipei'
+            
+        calendar_service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=event_obj).execute()
+    except Exception as e:
+        print(f"精準恢復 Google 日曆失敗 (Event ID: {event_id}): {e}")
+        
+        # 如果用 ID 找不到 (可能被手動刪了)，退回舊版的安全模式，再試著用時間找一次
+        revert_google_calendar_event_fallback(start_time)
+
+def revert_google_calendar_event_fallback(start_time: datetime):
     if not calendar_service or not CALENDAR_ID:
         return
     try:
         events = get_google_calendar_events()
         for ge in events:
-            if ge['start_time'] == start_time and not ge['is_full_day']:
+            # 這裡加上一點寬容度，解決可能的小時差
+            time_diff = abs((ge['start_time'] - start_time).total_seconds())
+            if time_diff < 60 and not ge['is_full_day']: # 時間差距在 1 分鐘內才算找到
                 event_id = ge['id']
                 event_obj = calendar_service.events().get(calendarId=CALENDAR_ID, eventId=event_id).execute()
-                
                 time_str = start_time.strftime("%H:%M")
                 event_obj['summary'] = time_str
                 event_obj['description'] = ""
-                
                 default_end = start_time + timedelta(hours=1)
                 if 'dateTime' in event_obj['end']:
                     event_obj['end']['dateTime'] = default_end.strftime("%Y-%m-%dT%H:%M:%S+08:00")
                 calendar_service.events().update(calendarId=CALENDAR_ID, eventId=event_id, body=event_obj).execute()
                 break
     except Exception as e:
-        print(f"恢復 Google 日曆失敗: {e}")
+        print(f"備用恢復 Google 日曆失敗: {e}")
 
 # ==========================================
 # 1. 資料庫設定
@@ -139,6 +162,8 @@ class BookingDB(Base):
     end_time = Column(DateTime)
     created_at = Column(DateTime, default=datetime.now)
     payment_status = Column(String, default="待匯款")
+    # ★ 新增：儲存 Google 日曆的事件 ID，用來精準打擊
+    google_event_id = Column(String, nullable=True)
 
 class VipDB(Base):
     __tablename__ = "vips"
@@ -173,6 +198,7 @@ def upgrade_db_schema():
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS remittance_last_5 VARCHAR;",
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_status VARCHAR DEFAULT '待匯款';",
+        "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS google_event_id VARCHAR;", # ★ 新增這個欄位
         "ALTER TABLE vips DROP CONSTRAINT IF EXISTS vips_user_phone_key;",
         "DROP INDEX IF EXISTS ix_vips_user_phone;",
         "ALTER TABLE blacklist DROP CONSTRAINT IF EXISTS blacklist_user_phone_key;",
@@ -208,7 +234,7 @@ class BlacklistCreate(BaseModel):
     user_phone: Optional[str] = None
     reason: Optional[str] = None
 
-app = FastAPI(title="單人美甲工作室 - 營運管理加強版 (含日誌與防搶單)")
+app = FastAPI(title="單人美甲工作室 - 精準防誤殺版")
 
 app.add_middleware(
     CORSMiddleware,
@@ -332,10 +358,17 @@ async def auto_cancel_unpaid_bookings():
             ).all()
             for b in expired_bookings:
                 target_start = b.start_time
+                target_event_id = b.google_event_id
+                
                 log_action(db, "系統取消", b.user_name, b.user_phone, b.start_time, "超過72小時未匯款自動取消")
                 db.delete(b)
                 db.commit()
-                revert_google_calendar_event(target_start)
+                
+                # ★ 使用精準取消
+                if target_event_id:
+                    revert_google_calendar_event_by_id(target_event_id, target_start)
+                else:
+                    revert_google_calendar_event_fallback(target_start)
             db.close()
         except Exception as e:
             print(f"自動巡邏發生錯誤: {e}")
@@ -348,7 +381,7 @@ async def startup_event():
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"message": "系統運行中：日誌與防搶單系統已上線！"}
+    return {"message": "系統運行中：精準防誤刪機制已上線！"}
 
 @app.get("/check-vip/{phone}")
 def api_check_vip(phone: str, name: str = "VIP客戶", db: Session = Depends(get_db)):
@@ -510,7 +543,8 @@ def get_admin_bookings(pwd: str, db: Session = Depends(get_db)):
             "service_type": b.service_type, "remittance_last_5": b.remittance_last_5,
             "start_time_display": b.start_time.strftime("%m/%d %H:%M"),
             "created_at_display": b.created_at.strftime("%m/%d %H:%M"),
-            "created_at": b.created_at.isoformat(), "payment_status": b.payment_status
+            "created_at": b.created_at.isoformat(), "payment_status": b.payment_status,
+            "google_event_id": b.google_event_id # 回傳以便除錯
         })
     return res
 
@@ -592,8 +626,6 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"目前僅開放預約至 {max_month} 月底喔！後續月份將於日後陸續開放，敬請見諒。")
         
     google_events = get_google_calendar_events()
-    
-    # ★ 防搶單：送出前強制檢查該時段狀態是否還是 OPEN
     target_event = next((ge for ge in google_events if ge['start_time'] == booking_start_time and not ge['is_full_day']), None)
     
     if not target_event:
@@ -609,11 +641,13 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
     calculated_end_time = booking_start_time + timedelta(minutes=(DEFAULT_DURATION + BUFFER_TIME))
     initial_payment_status = "待對帳" if re.search(r'\d{3,}', booking.remittance_last_5) else "待匯款"
 
+    # ★ 建立預約時，一併存入 target_event_id
     new_booking = BookingDB(
         user_name=booking.user_name, user_phone=user_phone, service_name="美甲預約",
         service_type=booking.service_type, remittance_last_5=booking.remittance_last_5,
         start_time=booking_start_time, end_time=calculated_end_time,
-        created_at=datetime.now(), payment_status=initial_payment_status
+        created_at=datetime.now(), payment_status=initial_payment_status,
+        google_event_id=target_event_id 
     )
     db.add(new_booking)
     db.commit()
@@ -632,13 +666,22 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
 def delete_booking(booking_id: int, db: Session = Depends(get_db)):
     booking_to_delete = db.query(BookingDB).filter(BookingDB.id == booking_id).first()
     if not booking_to_delete: raise HTTPException(status_code=404)
+    
     target_start_time = booking_to_delete.start_time
+    target_event_id = booking_to_delete.google_event_id # ★ 拿出身分證號碼
     
     log_action(db, "取消", booking_to_delete.user_name, booking_to_delete.user_phone, target_start_time, "客人手動取消預約")
     
     db.delete(booking_to_delete)
     db.commit()
-    revert_google_calendar_event(target_start_time)
+    
+    # ★ 精準打擊：優先用 ID 取消，真的找不到才用時間找
+    if target_event_id:
+        revert_google_calendar_event_by_id(target_event_id, target_start_time)
+    else:
+        # 這是為了相容「系統更新前就存在的舊預約」
+        revert_google_calendar_event_fallback(target_start_time)
+        
     return {"message": "成功取消預約！"}
 
 if __name__ == "__main__":
