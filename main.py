@@ -156,11 +156,10 @@ class ActionLogDB(Base):
     action_time = Column(DateTime, default=datetime.now)
     details = Column(String, nullable=True)
 
-# ★ 黑名單資料庫：不再限制電話一定要唯一或必填
 class BlacklistDB(Base):
     __tablename__ = "blacklist"
     id = Column(Integer, primary_key=True, index=True)
-    user_phone = Column(String, nullable=True) # 解除限制
+    user_phone = Column(String, nullable=True)
     user_name = Column(String, nullable=True)
     reason = Column(String, nullable=True)
     added_at = Column(DateTime, default=datetime.now)
@@ -176,7 +175,6 @@ def upgrade_db_schema():
         "ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_status VARCHAR DEFAULT '待匯款';",
         "ALTER TABLE vips DROP CONSTRAINT IF EXISTS vips_user_phone_key;",
         "DROP INDEX IF EXISTS ix_vips_user_phone;",
-        # 強制解除舊有黑名單的電話唯一限制
         "ALTER TABLE blacklist DROP CONSTRAINT IF EXISTS blacklist_user_phone_key;",
         "DROP INDEX IF EXISTS ix_blacklist_user_phone;"
     ]
@@ -210,7 +208,7 @@ class BlacklistCreate(BaseModel):
     user_phone: Optional[str] = None
     reason: Optional[str] = None
 
-app = FastAPI(title="單人美甲工作室 - 超彈性黑名單版")
+app = FastAPI(title="單人美甲工作室 - 營運管理加強版 (含日誌與防搶單)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -231,20 +229,16 @@ def get_db():
 def clean_vip_name(raw_name: str) -> str:
     return raw_name.split("(")[0].strip()
 
-# ★ 黑名單攔截檢查 (認名字也認電話)
 def is_blacklisted(user_phone: str, user_name: str, db: Session) -> bool:
     clean_name = clean_vip_name(user_name) if user_name else ""
     clean_phone = re.sub(r'\D', '', user_phone) if user_phone else ""
     
     bl_records = db.query(BlacklistDB).all()
     for b in bl_records:
-        # 如果黑名單有留名字，且預約者的名字對上了 -> 封鎖
         if b.user_name and clean_name and clean_vip_name(b.user_name) == clean_name:
             return True
-        # 如果黑名單有留電話，且預約者的電話對上了 -> 封鎖
         if b.user_phone and clean_phone and b.user_phone == clean_phone:
             return True
-            
     return False
 
 def log_action(db: Session, action_type: str, name: str, phone: str, target_time: datetime, details: str = ""):
@@ -354,7 +348,7 @@ async def startup_event():
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"message": "系統運行中：日誌與彈性黑名單系統已上線！"}
+    return {"message": "系統運行中：日誌與防搶單系統已上線！"}
 
 @app.get("/check-vip/{phone}")
 def api_check_vip(phone: str, name: str = "VIP客戶", db: Session = Depends(get_db)):
@@ -484,14 +478,10 @@ def get_blacklist(pwd: str, db: Session = Depends(get_db)):
 @app.post("/api/admin/blacklist")
 def add_blacklist(item: BlacklistCreate, pwd: str, db: Session = Depends(get_db)):
     if pwd != BOSS_PWD: raise HTTPException(status_code=401)
-    
-    # 確保至少填了一個
     if not item.user_name and not item.user_phone:
         raise HTTPException(status_code=400, detail="姓名和電話至少需要填寫一項！")
-        
     clean_phone = re.sub(r'\D', '', item.user_phone) if item.user_phone else None
     clean_name = clean_vip_name(item.user_name) if item.user_name else None
-    
     new_bl = BlacklistDB(user_phone=clean_phone, user_name=clean_name, reason=item.reason)
     db.add(new_bl)
     db.commit()
@@ -602,9 +592,19 @@ def create_booking(booking: BookingCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=f"目前僅開放預約至 {max_month} 月底喔！後續月份將於日後陸續開放，敬請見諒。")
         
     google_events = get_google_calendar_events()
-    target_event_id = next((ge['id'] for ge in google_events if ge['start_time'] == booking_start_time and not ge['is_full_day'] and get_event_status(ge['summary'], ge['start_time']) == "OPEN"), None)
-    if not target_event_id:
-        raise HTTPException(status_code=400, detail="這個時段尚未開放，或剛剛被預約走囉！")
+    
+    # ★ 防搶單：送出前強制檢查該時段狀態是否還是 OPEN
+    target_event = next((ge for ge in google_events if ge['start_time'] == booking_start_time and not ge['is_full_day']), None)
+    
+    if not target_event:
+        raise HTTPException(status_code=400, detail="這個時段尚未開放，或剛剛被取消囉！請重新整理頁面。")
+        
+    current_status = get_event_status(target_event['summary'], target_event['start_time'])
+    
+    if current_status != "OPEN":
+        raise HTTPException(status_code=400, detail="太可惜了！這個時段剛剛被其他客人搶先一步預約走了，請重新選擇其他時段喔！")
+    
+    target_event_id = target_event['id']
     
     calculated_end_time = booking_start_time + timedelta(minutes=(DEFAULT_DURATION + BUFFER_TIME))
     initial_payment_status = "待對帳" if re.search(r'\d{3,}', booking.remittance_last_5) else "待匯款"
